@@ -29,7 +29,6 @@ const DAEMON_ARG: &str = "__stay_daemon";
 struct Paths {
     state_dir: PathBuf,
     sessions_dir: PathBuf,
-    sockets_dir: PathBuf,
     daemon_socket: PathBuf,
 }
 
@@ -327,7 +326,7 @@ fn pump_terminal(stream: &mut UnixStream, master: &File) -> StayResult<()> {
             write_all_fd(master, &from_client[..read])?;
         }
         if pty_ready.contains(PollFlags::POLLIN) {
-            let read = nix_read(master, &mut from_pty)
+            let read = nix_read(master.as_raw_fd(), &mut from_pty)
                 .map_err(|err| StayError::new(err.to_string()))?;
             if read == 0 {
                 break;
@@ -769,7 +768,6 @@ fn prepare_paths() -> StayResult<Paths> {
         daemon_socket: sockets_dir.join("daemon.sock"),
         state_dir,
         sessions_dir,
-        sockets_dir,
     })
 }
 
