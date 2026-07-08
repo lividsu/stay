@@ -24,6 +24,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const DAEMON_ARG: &str = "__stay_daemon";
+const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
 
 #[derive(Clone)]
 struct Paths {
@@ -189,7 +192,6 @@ fn handle_attach(
     let mut start_command = command.clone().unwrap_or_else(shell_command);
     let mut start_cwd = cwd.clone();
     let mut message = String::new();
-    let explicit_command = command.is_some();
 
     {
         let mut sessions_guard = sessions.lock().expect("sessions lock poisoned");
@@ -207,14 +209,14 @@ fn handle_attach(
                         );
                     }
 
+                    message.push_str(&space_message(&name));
                     if command.is_some()
                         && command.as_ref().is_some_and(|cmd| cmd != &existing.record.command)
                     {
                         message.push_str(&format!(
-                            "Session {name} already exists.\nAttaching to existing session.\n"
+                            "{DIM}existing session kept; command ignored{RESET}\n"
                         ));
                     }
-                    message.push_str(&format!("Attached to {name}.\nDetach: Ctrl+A\n"));
                     existing.record.last_attached_at = Some(now());
                     write_record(&paths, &existing.record)?;
                 }
@@ -241,7 +243,7 @@ fn handle_attach(
                     existing.record = record;
                     existing.master = Some(master);
                     existing.attached = false;
-                    message.push_str(&new_session_message(&name, &start_command, explicit_command));
+                    message.push_str(&new_session_message(&name));
                 }
             }
         } else {
@@ -255,7 +257,7 @@ fn handle_attach(
                     attached: false,
                 },
             );
-            message.push_str(&new_session_message(&name, &start_command, explicit_command));
+            message.push_str(&new_session_message(&name));
         }
     }
 
@@ -821,14 +823,12 @@ fn session_path(paths: &Paths, name: &str) -> PathBuf {
     paths.sessions_dir.join(format!("{name}.json"))
 }
 
-fn new_session_message(name: &str, command: &[String], explicit_command: bool) -> String {
-    let mut message = format!("Stay session: {name}\n");
-    if explicit_command {
-        message.push_str(&format!("Command: {}\n", display_command(command)));
-    }
-    message.push_str("Detach: Ctrl+A\n");
-    message.push_str(&format!("Reattach: stay {name}\n"));
-    message
+fn new_session_message(name: &str) -> String {
+    space_message(name)
+}
+
+fn space_message(name: &str) -> String {
+    format!("{CLEAR_SCREEN}{DIM}inside {name}  |  Ctrl+A to leave{RESET}\n\n")
 }
 
 fn now() -> String {
