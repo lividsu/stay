@@ -24,6 +24,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const DAEMON_ARG: &str = "__stay_daemon";
+const ALT_SCREEN_ENTER: &str = "\x1b[?1049h";
+const ALT_SCREEN_EXIT: &str = "\x1b[?1049l";
 const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
@@ -63,6 +65,11 @@ pub fn run() -> StayResult<()> {
             ensure_daemon()?;
             list_sessions()
         }
+        [cmd] if cmd == "completions" || cmd == "completion" => {
+            print_completion_usage();
+            Ok(())
+        }
+        [cmd, shell] if cmd == "completions" || cmd == "completion" => print_completions(shell),
         [cmd, name] if cmd == "kill" => {
             validate_session_name(name).map_err(StayError::new)?;
             ensure_daemon()?;
@@ -104,6 +111,7 @@ fn print_usage() {
     println!("  stay ls");
     println!("  stay kill <name>");
     println!("  stay rm <name>");
+    println!("  stay completions <bash|zsh|fish>");
 }
 
 fn run_daemon() -> StayResult<()> {
@@ -153,7 +161,9 @@ fn handle_client(mut stream: UnixStream, sessions: Sessions, paths: Paths) -> St
             restart,
             rows,
             cols,
-        } => handle_attach(stream, sessions, paths, name, cwd, command, restart, rows, cols),
+        } => handle_attach(
+            stream, sessions, paths, name, cwd, command, restart, rows, cols,
+        ),
         Request::Kill { name } => {
             let message = kill_session(&name, &sessions, &paths)?;
             write_response(&mut stream, &Response::Ok { message })
@@ -211,7 +221,9 @@ fn handle_attach(
 
                     message.push_str(&space_message(&name));
                     if command.is_some()
-                        && command.as_ref().is_some_and(|cmd| cmd != &existing.record.command)
+                        && command
+                            .as_ref()
+                            .is_some_and(|cmd| cmd != &existing.record.command)
                     {
                         message.push_str(&format!(
                             "{DIM}existing session kept; command ignored{RESET}\n"
@@ -306,8 +318,7 @@ fn pump_terminal(stream: &mut UnixStream, master: &File) -> StayResult<()> {
                     PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
                 ),
             ];
-            poll(&mut fds, PollTimeout::NONE)
-                .map_err(|err| StayError::new(err.to_string()))?;
+            poll(&mut fds, PollTimeout::NONE).map_err(|err| StayError::new(err.to_string()))?;
             (
                 fds[0].revents().unwrap_or(PollFlags::empty()),
                 fds[1].revents().unwrap_or(PollFlags::empty()),
@@ -550,11 +561,7 @@ fn attach(name: &str, command: Option<Vec<String>>, restart: bool) -> StayResult
 
     let response = read_response(&stream)?;
     match response {
-        Response::AttachReady { message } => {
-            print!("{message}");
-            io::stdout().flush()?;
-            run_raw_client(stream, name)
-        }
+        Response::AttachReady { message } => run_raw_client(stream, name, &message),
         Response::NeedsRestart {
             state,
             exit_code,
@@ -585,13 +592,17 @@ fn attach(name: &str, command: Option<Vec<String>>, restart: bool) -> StayResult
     }
 }
 
-fn run_raw_client(mut stream: UnixStream, name: &str) -> StayResult<()> {
+fn run_raw_client(mut stream: UnixStream, name: &str, message: &str) -> StayResult<()> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
     let original = tcgetattr(stdin_fd).map_err(|err| StayError::new(err.to_string()))?;
-    let guard = RawModeGuard {
+    let mut guard = TerminalGuard {
         fd_termios: Some((stdin.as_raw_fd(), original)),
+        in_world: false,
     };
+
+    enter_world(name, message)?;
+    guard.in_world = true;
 
     let mut raw = guard
         .fd_termios
@@ -617,8 +628,7 @@ fn run_raw_client(mut stream: UnixStream, name: &str) -> StayResult<()> {
                     PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
                 ),
             ];
-            poll(&mut fds, PollTimeout::NONE)
-                .map_err(|err| StayError::new(err.to_string()))?;
+            poll(&mut fds, PollTimeout::NONE).map_err(|err| StayError::new(err.to_string()))?;
             (
                 fds[0].revents().unwrap_or(PollFlags::empty()),
                 fds[1].revents().unwrap_or(PollFlags::empty()),
@@ -663,24 +673,41 @@ fn run_raw_client(mut stream: UnixStream, name: &str) -> StayResult<()> {
 
     drop(guard);
     if detached {
-        println!("\nDetached from {name}.");
+        println!("Returned from {name}.");
         println!("Reattach with: stay {name}");
     }
 
     Ok(())
 }
 
-struct RawModeGuard {
+struct TerminalGuard {
     fd_termios: Option<(i32, Termios)>,
+    in_world: bool,
 }
 
-impl Drop for RawModeGuard {
+impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if let Some((fd, termios)) = self.fd_termios.take() {
             let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
             let _ = tcsetattr(borrowed, SetArg::TCSANOW, &termios);
         }
+        if self.in_world {
+            print!("{ALT_SCREEN_EXIT}");
+            let _ = io::stdout().flush();
+        }
     }
+}
+
+fn enter_world(name: &str, message: &str) -> StayResult<()> {
+    print!("{ALT_SCREEN_ENTER}{CLEAR_SCREEN}");
+    println!("{DIM}stay:{name}  |  Ctrl+A to return{RESET}");
+    if !message.is_empty() {
+        print!("{message}");
+    } else {
+        println!();
+    }
+    io::stdout().flush()?;
+    Ok(())
 }
 
 fn list_sessions() -> StayResult<()> {
@@ -828,7 +855,144 @@ fn new_session_message(name: &str) -> String {
 }
 
 fn space_message(name: &str) -> String {
-    format!("{CLEAR_SCREEN}{DIM}inside {name}  |  Ctrl+A to leave{RESET}\n\n")
+    format!("{DIM}arrived in {name}{RESET}\n\n")
+}
+
+fn print_completion_usage() {
+    println!("Usage: stay completions <bash|zsh|fish>");
+}
+
+fn print_completions(shell: &str) -> StayResult<()> {
+    match shell {
+        "bash" => {
+            print!("{}", bash_completions());
+            Ok(())
+        }
+        "zsh" => {
+            print!("{}", zsh_completions());
+            Ok(())
+        }
+        "fish" => {
+            print!("{}", fish_completions());
+            Ok(())
+        }
+        _ => Err(StayError::new(format!(
+            "Unsupported shell: {shell}\n\nUse one of: bash, zsh, fish."
+        ))),
+    }
+}
+
+fn bash_completions() -> &'static str {
+    r#"_stay_sessions() {
+  local dir="${XDG_STATE_HOME:-$HOME/.local/state}/stay/sessions"
+  local path name
+  [ -d "$dir" ] || return 0
+  for path in "$dir"/*.json; do
+    [ -e "$path" ] || continue
+    name="${path##*/}"
+    printf '%s\n' "${name%.json}"
+  done
+}
+
+_stay_complete() {
+  local cur prev commands shells
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  commands="ls kill rm completions completion --version -V"
+  shells="bash zsh fish"
+
+  if [ "$COMP_CWORD" -eq 1 ]; then
+    COMPREPLY=( $(compgen -W "$commands $(_stay_sessions)" -- "$cur") )
+    return 0
+  fi
+
+  case "$prev" in
+    kill|rm)
+      COMPREPLY=( $(compgen -W "$(_stay_sessions)" -- "$cur") )
+      ;;
+    completions|completion)
+      COMPREPLY=( $(compgen -W "$shells" -- "$cur") )
+      ;;
+    *)
+      COMPREPLY=()
+      ;;
+  esac
+}
+
+complete -F _stay_complete stay
+"#
+}
+
+fn zsh_completions() -> &'static str {
+    r#"#compdef stay
+
+_stay_sessions() {
+  local dir="${XDG_STATE_HOME:-$HOME/.local/state}/stay/sessions"
+  local -a sessions
+  local path name
+  [[ -d "$dir" ]] || return 1
+  for path in "$dir"/*.json(N); do
+    name="${path:t:r}"
+    sessions+=("$name")
+  done
+  compadd -- "$sessions[@]"
+}
+
+_stay() {
+  local -a commands shells
+  commands=(
+    'ls:list sessions'
+    'kill:kill a running session'
+    'rm:remove a stopped session'
+    'completions:print shell completions'
+    'completion:print shell completions'
+  )
+  shells=(bash zsh fish)
+
+  case $CURRENT in
+    2)
+      _alternative \
+        'commands:command:->commands' \
+        'sessions:session:->sessions'
+      case $state in
+        commands) _describe 'command' commands ;;
+        sessions) _stay_sessions ;;
+      esac
+      ;;
+    3)
+      case $words[2] in
+        kill|rm) _stay_sessions ;;
+        completions|completion) compadd -- "$shells[@]" ;;
+      esac
+      ;;
+  esac
+}
+
+_stay "$@"
+"#
+}
+
+fn fish_completions() -> &'static str {
+    r#"function __stay_sessions
+    set -l dir "$HOME/.local/state/stay/sessions"
+    if set -q XDG_STATE_HOME
+        set dir "$XDG_STATE_HOME/stay/sessions"
+    end
+    test -d "$dir"; or return
+    for path in "$dir"/*.json
+        test -e "$path"; and basename "$path" .json
+    end
+end
+
+complete -c stay -f
+complete -c stay -n "__fish_use_subcommand" -a "ls" -d "List sessions"
+complete -c stay -n "__fish_use_subcommand" -a "kill" -d "Kill a running session"
+complete -c stay -n "__fish_use_subcommand" -a "rm" -d "Remove a stopped session"
+complete -c stay -n "__fish_use_subcommand" -a "completions" -d "Print shell completions"
+complete -c stay -n "__fish_use_subcommand" -a "(__stay_sessions)"
+complete -c stay -n "__fish_seen_subcommand_from kill rm" -a "(__stay_sessions)"
+complete -c stay -n "__fish_seen_subcommand_from completions completion" -a "bash zsh fish"
+"#
 }
 
 fn now() -> String {
@@ -852,7 +1016,8 @@ fn terminal_size() -> (u16, u16) {
 
 fn write_all_fd<Fd: std::os::fd::AsFd>(fd: Fd, mut bytes: &[u8]) -> StayResult<()> {
     while !bytes.is_empty() {
-        let written = nix_write(fd.as_fd(), bytes).map_err(|err| StayError::new(err.to_string()))?;
+        let written =
+            nix_write(fd.as_fd(), bytes).map_err(|err| StayError::new(err.to_string()))?;
         if written == 0 {
             return Err(StayError::new("write returned 0 bytes"));
         }

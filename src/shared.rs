@@ -91,16 +91,24 @@ pub enum Request {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
-    AttachReady { message: String },
-    Error { message: String },
+    AttachReady {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
     NeedsRestart {
         name: String,
         state: SessionState,
         exit_code: Option<i32>,
         command: Vec<String>,
     },
-    Ok { message: String },
-    Sessions { sessions: Vec<SessionRecord> },
+    Ok {
+        message: String,
+    },
+    Sessions {
+        sessions: Vec<SessionRecord>,
+    },
 }
 
 pub fn validate_session_name(name: &str) -> Result<(), String> {

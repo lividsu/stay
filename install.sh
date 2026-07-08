@@ -27,6 +27,7 @@ finish() {
   chmod +x "$bin_dir/stay"
 
   echo "stay has been installed to $bin_dir/stay"
+  install_completions
 
   case ":$PATH:" in
     *":$bin_dir:"*) ;;
@@ -37,6 +38,41 @@ finish() {
       echo "export PATH=\"$bin_dir:\$PATH\""
       ;;
   esac
+}
+
+install_completions() {
+  data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+  config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+  installed=""
+
+  bash_dir="$data_home/bash-completion/completions"
+  mkdir -p "$bash_dir"
+  if "$bin_dir/stay" completions bash > "$bash_dir/stay" 2>/dev/null; then
+    installed="$installed bash"
+  else
+    rm -f "$bash_dir/stay"
+  fi
+
+  zsh_dir="${ZDOTDIR:-$HOME}/.zsh/completions"
+  mkdir -p "$zsh_dir"
+  if "$bin_dir/stay" completions zsh > "$zsh_dir/_stay" 2>/dev/null; then
+    installed="$installed zsh"
+  else
+    rm -f "$zsh_dir/_stay"
+  fi
+
+  fish_dir="$config_home/fish/completions"
+  mkdir -p "$fish_dir"
+  if "$bin_dir/stay" completions fish > "$fish_dir/stay.fish" 2>/dev/null; then
+    installed="$installed fish"
+  else
+    rm -f "$fish_dir/stay.fish"
+  fi
+
+  if [ -n "$installed" ]; then
+    echo "Shell completions installed for:$installed"
+    echo "For zsh, make sure this directory is in fpath: $zsh_dir"
+  fi
 }
 
 install_from_release() {

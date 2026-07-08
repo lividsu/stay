@@ -3,6 +3,8 @@
 A tiny terminal session keeper for Linux.
 
 Run a command, press Ctrl+A to leave, come back with `stay <name>`.
+Stay opens the session in a clean alternate screen, then restores your previous
+terminal history when you return.
 
 ## Why Stay
 
@@ -12,6 +14,9 @@ task running after SSH disconnects.
 Compared with `screen`, Stay keeps the workflow smaller:
 
 - Easy commands: use `stay api`, `stay ls`, `stay kill api`, and `stay rm api`.
+- Portal-like attach: `stay api` clears into its own screen, and Ctrl+A brings
+  your old terminal view back.
+- Smart tab completion: shell completions can suggest existing session names.
 - Native copy and scroll: Stay does not add its own copy mode, so you keep using
   your terminal's normal scrollback and copy behavior.
 - Persistent records: after a reboot, running tasks are gone, but Stay keeps the
@@ -43,6 +48,7 @@ stay <name> -- <command>
 stay ls
 stay kill <name>
 stay rm <name>
+stay completions <bash|zsh|fish>
 ```
 
 Session state is stored under `~/.local/state/stay/`.
@@ -55,7 +61,8 @@ curl -fsSL https://raw.githubusercontent.com/lividsu/stay/main/install.sh | sh
 
 The installer downloads the latest Linux static release binary to `~/.local/bin/stay`.
 If no release binary is available yet, it falls back to building from source with
-the server's local Rust toolchain.
+the server's local Rust toolchain. It also installs shell completions for bash,
+zsh, and fish where those shells look for user completions.
 
 After installing:
 
@@ -73,6 +80,16 @@ cargo build --release
 ```
 
 Stay V1 targets Linux only.
+
+## Shell Completion
+
+The installer writes completion files automatically. To install one manually:
+
+```bash
+stay completions bash > ~/.local/share/bash-completion/completions/stay
+stay completions zsh > ~/.zsh/completions/_stay
+stay completions fish > ~/.config/fish/completions/stay.fish
+```
 
 ## Release
 
