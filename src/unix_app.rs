@@ -353,6 +353,12 @@ fn handle_client(mut stream: UnixStream, sessions: Sessions, paths: Paths) -> St
         Request::Remove { name } => {
             write_command_result(&mut stream, remove_session(&name, &sessions, &paths))
         }
+        Request::DaemonInfo => write_response(
+            &mut stream,
+            &Response::DaemonInfo {
+                version: VERSION.to_string(),
+            },
+        ),
     }
 }
 
@@ -845,12 +851,32 @@ fn process_alive(pid: i32) -> bool {
 }
 
 fn ensure_daemon() -> StayResult<()> {
-    if connect_daemon().is_ok() {
+    if daemon_is_current() {
         return Ok(());
     }
 
     let paths = prepare_paths()?;
     if paths.daemon_socket.exists() {
+        if connect_daemon().is_ok() {
+            match running_sessions_from_existing_daemon() {
+                Ok(running) if running.is_empty() => {}
+                Ok(running) => {
+                    let names = running
+                        .iter()
+                        .map(|session| session.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(StayError::new(format!(
+                        "A stay daemon from another version is already running with active sessions: {names}\n\nFinish or kill those sessions before starting the new daemon."
+                    )));
+                }
+                Err(err) => {
+                    return Err(StayError::new(format!(
+                        "A stay daemon from another version is already running, but Stay could not inspect it:\n\n{err}\n\nStop the old daemon, then try again."
+                    )));
+                }
+            }
+        }
         let _ = fs::remove_file(&paths.daemon_socket);
     }
 
@@ -878,6 +904,33 @@ fn ensure_daemon() -> StayResult<()> {
     }
 
     Err(StayError::new("Failed to start stay daemon."))
+}
+
+fn daemon_is_current() -> bool {
+    let Ok(mut stream) = connect_daemon() else {
+        return false;
+    };
+    if write_json_line(&mut stream, &Request::DaemonInfo).is_err() {
+        return false;
+    }
+
+    matches!(
+        read_response(&stream),
+        Ok(Response::DaemonInfo { version }) if version == VERSION
+    )
+}
+
+fn running_sessions_from_existing_daemon() -> StayResult<Vec<SessionRecord>> {
+    let mut stream = connect_daemon()?;
+    write_json_line(&mut stream, &Request::List)?;
+    match read_response(&stream)? {
+        Response::Sessions { sessions } => Ok(sessions
+            .into_iter()
+            .filter(|session| session.state == SessionState::Running)
+            .collect()),
+        Response::Error { message } => Err(StayError::new(message)),
+        other => Err(StayError::new(format!("Unexpected response: {other:?}"))),
+    }
 }
 
 fn connect_daemon() -> StayResult<UnixStream> {

@@ -86,6 +86,7 @@ pub enum Request {
     Remove {
         name: String,
     },
+    DaemonInfo,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -113,6 +114,9 @@ pub enum Response {
     },
     Sessions {
         sessions: Vec<SessionRecord>,
+    },
+    DaemonInfo {
+        version: String,
     },
 }
 
