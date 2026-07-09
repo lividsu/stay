@@ -83,12 +83,33 @@ Stay V1 targets Linux only.
 
 ## Shell Completion
 
-The installer writes completion files automatically. To install one manually:
+Type `stay <Tab>` to complete commands and existing session names.
+
+The installer sets this up for you: it writes the completion files and adds a
+line to `~/.bashrc` / `~/.zshrc` so completion loads in new shells. Open a new
+terminal after installing. (Set `STAY_NO_RC=1` to skip the shell config edits.)
+
+If you built from source with `cargo build`, enable it yourself.
+
+bash — add to `~/.bashrc`:
 
 ```bash
-stay completions bash > ~/.local/share/bash-completion/completions/stay
+eval "$(stay completions bash)"
+```
+
+fish — add to `~/.config/fish/config.fish`:
+
+```fish
+stay completions fish | source
+```
+
+zsh loads completions as autoloaded functions on `fpath`, so write the file and
+initialize the completion system in `~/.zshrc`:
+
+```zsh
 stay completions zsh > ~/.zsh/completions/_stay
-stay completions fish > ~/.config/fish/completions/stay.fish
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit && compinit
 ```
 
 ## Release

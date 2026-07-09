@@ -34,6 +34,11 @@ const ACCENT: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
+/// Delay between transition animation frames. Lower is faster.
+const FRAME_DELAY_MS: u64 = 36;
+/// Maximum bytes of per-session output kept for replay on re-attach.
+const SCROLLBACK_LIMIT: usize = 2 * 1024 * 1024;
+
 #[derive(Clone)]
 struct Paths {
     state_dir: PathBuf,
@@ -44,10 +49,70 @@ struct Paths {
 struct ManagedSession {
     record: SessionRecord,
     master: Option<File>,
+    io: SharedIo,
     attached: bool,
 }
 
 type Sessions = Arc<Mutex<HashMap<String, ManagedSession>>>;
+type SharedIo = Arc<Mutex<SessionIo>>;
+
+/// Live output plumbing for one session.
+///
+/// A background reader thread drains the PTY into `buffer` even while no client
+/// is attached, so nothing produced in the background is lost. On attach the
+/// whole buffer is replayed, then `subscriber` receives live output.
+struct SessionIo {
+    buffer: Vec<u8>,
+    subscriber: Option<UnixStream>,
+}
+
+impl SessionIo {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            subscriber: None,
+        }
+    }
+
+    fn shared() -> SharedIo {
+        Arc::new(Mutex::new(Self::new()))
+    }
+
+    /// Append a chunk of PTY output to the replay buffer.
+    ///
+    /// An explicit "clear scrollback" (ESC [ 3 J), which `clear` emits on
+    /// terminals that support it, drops the earlier history so a cleared screen
+    /// stays cleared on the next attach. The buffer is otherwise capped to the
+    /// most recent `SCROLLBACK_LIMIT` bytes, trimmed at a line boundary.
+    fn record(&mut self, chunk: &[u8]) {
+        if let Some(pos) = last_clear_scrollback(chunk) {
+            self.buffer.clear();
+            self.buffer.extend_from_slice(&chunk[pos..]);
+        } else {
+            self.buffer.extend_from_slice(chunk);
+        }
+
+        if self.buffer.len() > SCROLLBACK_LIMIT {
+            let overflow = self.buffer.len() - SCROLLBACK_LIMIT;
+            let mut cut = overflow;
+            if let Some(nl) = self.buffer[cut..].iter().position(|byte| *byte == b'\n') {
+                cut += nl + 1;
+            }
+            self.buffer.drain(..cut.min(self.buffer.len()));
+        }
+    }
+}
+
+/// Index of the ESC starting the last `ESC [ 3 J` sequence in `chunk`, if any.
+fn last_clear_scrollback(chunk: &[u8]) -> Option<usize> {
+    const SEQ: &[u8] = b"\x1b[3J";
+    if chunk.len() < SEQ.len() {
+        return None;
+    }
+    (0..=chunk.len() - SEQ.len())
+        .rev()
+        .find(|&index| &chunk[index..index + SEQ.len()] == SEQ)
+}
 
 pub fn run() -> StayResult<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -312,22 +377,24 @@ fn handle_attach(
                         existing.record.command.clone()
                     };
                     start_cwd = existing.record.cwd.clone();
-                    let (record, master) =
+                    let (record, master, io) =
                         spawn_session(&name, &start_cwd, &start_command, rows, cols, &paths)?;
                     existing.record = record;
                     existing.master = Some(master);
+                    existing.io = io;
                     existing.attached = false;
                     message.push_str(&new_session_message(&name));
                 }
             }
         } else {
-            let (record, master) =
+            let (record, master, io) =
                 spawn_session(&name, &start_cwd, &start_command, rows, cols, &paths)?;
             sessions_guard.insert(
                 name.clone(),
                 ManagedSession {
                     record,
                     master: Some(master),
+                    io,
                     attached: false,
                 },
             );
@@ -340,7 +407,7 @@ fn handle_attach(
 }
 
 fn attach_stream(name: String, mut stream: UnixStream, sessions: Sessions) -> StayResult<()> {
-    let master = {
+    let (master, io) = {
         let mut sessions_guard = sessions.lock().expect("sessions lock poisoned");
         let session = sessions_guard
             .get_mut(&name)
@@ -351,11 +418,14 @@ fn attach_stream(name: String, mut stream: UnixStream, sessions: Sessions) -> St
             .ok_or_else(|| StayError::new(format!("Session {name} is stopped.")))?
             .try_clone()?;
         session.attached = true;
-        master
+        (master, Arc::clone(&session.io))
     };
 
-    let result = pump_terminal(&mut stream, &master);
+    let result = serve_attached(&mut stream, &master, &io);
 
+    // Always release the session, even if replay or input pumping failed, so a
+    // future attach is not blocked by a stale `attached` flag.
+    io.lock().expect("session io lock poisoned").subscriber = None;
     let mut sessions_guard = sessions.lock().expect("sessions lock poisoned");
     if let Some(session) = sessions_guard.get_mut(&name) {
         session.attached = false;
@@ -364,33 +434,39 @@ fn attach_stream(name: String, mut stream: UnixStream, sessions: Sessions) -> St
     result
 }
 
-fn pump_terminal(stream: &mut UnixStream, master: &File) -> StayResult<()> {
+/// Replay recorded history, then subscribe to live output and forward input.
+///
+/// The replay and the subscription happen together under the io lock so the
+/// reader thread cannot interleave new output with the replay or drop anything
+/// in the gap between them.
+fn serve_attached(stream: &mut UnixStream, master: &File, io: &SharedIo) -> StayResult<()> {
+    {
+        let mut io_guard = io.lock().expect("session io lock poisoned");
+        stream.write_all(&io_guard.buffer)?;
+        stream.flush()?;
+        io_guard.subscriber = Some(stream.try_clone()?);
+    }
+
+    pump_input(stream, master)
+}
+
+/// Forward client keystrokes to the PTY. Live PTY output flows the other way
+/// through the session's reader thread (see `run_pty_reader`), so this only
+/// watches the client side and exits when the client detaches or the PTY closes.
+fn pump_input(stream: &mut UnixStream, master: &File) -> StayResult<()> {
     let mut from_client = [0_u8; 8192];
-    let mut from_pty = [0_u8; 8192];
 
     loop {
-        let (stream_ready, pty_ready) = {
-            let mut fds = [
-                PollFd::new(
-                    stream.as_fd(),
-                    PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
-                ),
-                PollFd::new(
-                    master.as_fd(),
-                    PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
-                ),
-            ];
+        let stream_ready = {
+            let mut fds = [PollFd::new(
+                stream.as_fd(),
+                PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+            )];
             poll(&mut fds, PollTimeout::NONE).map_err(|err| StayError::new(err.to_string()))?;
-            (
-                fds[0].revents().unwrap_or(PollFlags::empty()),
-                fds[1].revents().unwrap_or(PollFlags::empty()),
-            )
+            fds[0].revents().unwrap_or(PollFlags::empty())
         };
 
         if stream_ready.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
-            break;
-        }
-        if pty_ready.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
             break;
         }
         if stream_ready.contains(PollFlags::POLLIN) {
@@ -399,14 +475,6 @@ fn pump_terminal(stream: &mut UnixStream, master: &File) -> StayResult<()> {
                 break;
             }
             write_all_fd(master, &from_client[..read])?;
-        }
-        if pty_ready.contains(PollFlags::POLLIN) {
-            let read = nix_read(master.as_raw_fd(), &mut from_pty)
-                .map_err(|err| StayError::new(err.to_string()))?;
-            if read == 0 {
-                break;
-            }
-            stream.write_all(&from_pty[..read])?;
         }
     }
 
@@ -420,7 +488,7 @@ fn spawn_session(
     rows: u16,
     cols: u16,
     paths: &Paths,
-) -> StayResult<(SessionRecord, File)> {
+) -> StayResult<(SessionRecord, File, SharedIo)> {
     let winsize = Winsize {
         ws_row: rows.max(1),
         ws_col: cols.max(1),
@@ -471,6 +539,13 @@ fn spawn_session(
     };
     write_record(paths, &record)?;
 
+    // Continuously drain the PTY into a replay buffer, even while detached, so
+    // background output is never lost and can be replayed on the next attach.
+    let io = SessionIo::shared();
+    let reader_master = master.try_clone()?;
+    let reader_io = Arc::clone(&io);
+    thread::spawn(move || run_pty_reader(reader_master, reader_io));
+
     let paths_for_thread = paths.clone();
     let name_for_thread = name.to_string();
     thread::spawn(move || {
@@ -483,7 +558,36 @@ fn spawn_session(
         }
     });
 
-    Ok((record, master))
+    Ok((record, master, io))
+}
+
+/// Drain the PTY master for the life of the session: record every byte for
+/// replay and forward it to the attached client, if any. When the PTY closes
+/// (the child exited), detach the client so it returns to its own terminal.
+fn run_pty_reader(master: File, io: SharedIo) {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match nix_read(master.as_raw_fd(), &mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                let chunk = &buffer[..read];
+                let mut io_guard = io.lock().expect("session io lock poisoned");
+                io_guard.record(chunk);
+                if let Some(subscriber) = io_guard.subscriber.as_mut() {
+                    if subscriber.write_all(chunk).is_err() {
+                        io_guard.subscriber = None;
+                    }
+                }
+            }
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => break,
+        }
+    }
+
+    let mut io_guard = io.lock().expect("session io lock poisoned");
+    if let Some(subscriber) = io_guard.subscriber.take() {
+        let _ = subscriber.shutdown(Shutdown::Both);
+    }
 }
 
 fn kill_session(name: &str, sessions: &Sessions, paths: &Paths) -> StayResult<String> {
@@ -791,7 +895,7 @@ fn play_pixel_transition(name: &str, entering: bool) -> StayResult<()> {
 
     for frame in frames {
         draw_pixel_frame(&label, frame, 8)?;
-        thread::sleep(Duration::from_millis(60));
+        thread::sleep(Duration::from_millis(FRAME_DELAY_MS));
     }
 
     print!("{SHOW_CURSOR}");
@@ -948,6 +1052,7 @@ fn load_records(paths: &Paths) -> StayResult<HashMap<String, ManagedSession>> {
             ManagedSession {
                 record,
                 master: None,
+                io: SessionIo::shared(),
                 attached: false,
             },
         );
@@ -1154,4 +1259,55 @@ fn write_all_fd<Fd: std::os::fd::AsFd>(fd: Fd, mut bytes: &[u8]) -> StayResult<(
 #[allow(dead_code)]
 fn _paths_are_private(paths: &Paths) -> bool {
     paths.state_dir.starts_with(Path::new("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_accumulates_output_for_replay() {
+        let mut io = SessionIo::new();
+        io.record(b"log line 1\n");
+        io.record(b"log line 2\n");
+        assert_eq!(io.buffer, b"log line 1\nlog line 2\n");
+    }
+
+    #[test]
+    fn record_drops_history_before_clear_scrollback() {
+        let mut io = SessionIo::new();
+        io.record(b"old output\n");
+        io.record(b"\x1b[3Jfresh output\n");
+        assert_eq!(io.buffer, b"\x1b[3Jfresh output\n");
+    }
+
+    #[test]
+    fn record_keeps_last_clear_within_a_chunk() {
+        let mut io = SessionIo::new();
+        io.record(b"a\x1b[3Jb\x1b[3Jc");
+        assert_eq!(io.buffer, b"\x1b[3Jc");
+    }
+
+    #[test]
+    fn record_trims_to_limit_on_a_line_boundary() {
+        let mut io = SessionIo::new();
+        let mut blob = Vec::new();
+        while blob.len() <= SCROLLBACK_LIMIT {
+            blob.extend_from_slice(b"a line of text\n");
+        }
+        io.record(&blob);
+        assert!(io.buffer.len() <= SCROLLBACK_LIMIT);
+        // Trimming keeps the most recent output and cuts on a line boundary,
+        // so the buffer still begins and ends with a whole line.
+        assert!(io.buffer.starts_with(b"a line of text\n"));
+        assert!(io.buffer.ends_with(b"a line of text\n"));
+    }
+
+    #[test]
+    fn last_clear_scrollback_finds_sequences() {
+        assert_eq!(last_clear_scrollback(b"no sequence here"), None);
+        assert_eq!(last_clear_scrollback(b"\x1b[3J"), Some(0));
+        assert_eq!(last_clear_scrollback(b"ab\x1b[3Jcd"), Some(2));
+        assert_eq!(last_clear_scrollback(b"\x1b[3Jx\x1b[3J"), Some(5));
+    }
 }

@@ -40,6 +40,36 @@ finish() {
   esac
 }
 
+rc_has() {
+  [ -f "$1" ] && grep -qF "$2" "$1" 2>/dev/null
+}
+
+# Source the bash completion from ~/.bashrc so tab completion works even when
+# the bash-completion package (which auto-loads it) is not installed.
+wire_bash() {
+  [ "${STAY_NO_RC:-0}" = "1" ] && return 0
+  rc="$HOME/.bashrc"
+  rc_has "$rc" "# stay completion" && return 0
+  {
+    printf '\n# stay completion\n'
+    printf '[ -f "%s" ] && . "%s"\n' "$1" "$1"
+  } >> "$rc"
+  echo "Enabled bash completion in $rc"
+}
+
+# Put the zsh completion directory on fpath and initialize the completion system.
+wire_zsh() {
+  [ "${STAY_NO_RC:-0}" = "1" ] && return 0
+  rc="${ZDOTDIR:-$HOME}/.zshrc"
+  rc_has "$rc" "# stay completion" && return 0
+  {
+    printf '\n# stay completion\n'
+    printf 'fpath=("%s" $fpath)\n' "$1"
+    printf 'autoload -Uz compinit && compinit\n'
+  } >> "$rc"
+  echo "Enabled zsh completion in $rc"
+}
+
 install_completions() {
   data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
   config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -49,6 +79,7 @@ install_completions() {
   mkdir -p "$bash_dir"
   if "$bin_dir/stay" completions bash > "$bash_dir/stay" 2>/dev/null; then
     installed="$installed bash"
+    wire_bash "$bash_dir/stay"
   else
     rm -f "$bash_dir/stay"
   fi
@@ -57,6 +88,7 @@ install_completions() {
   mkdir -p "$zsh_dir"
   if "$bin_dir/stay" completions zsh > "$zsh_dir/_stay" 2>/dev/null; then
     installed="$installed zsh"
+    wire_zsh "$zsh_dir"
   else
     rm -f "$zsh_dir/_stay"
   fi
@@ -71,7 +103,8 @@ install_completions() {
 
   if [ -n "$installed" ]; then
     echo "Shell completions installed for:$installed"
-    echo "For zsh, make sure this directory is in fpath: $zsh_dir"
+    echo "Restart your shell (or open a new terminal) to use tab completion."
+    echo "Skip shell config edits next time by setting STAY_NO_RC=1."
   fi
 }
 
