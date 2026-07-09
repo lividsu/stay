@@ -27,6 +27,10 @@ const DAEMON_ARG: &str = "__stay_daemon";
 const ALT_SCREEN_ENTER: &str = "\x1b[?1049h";
 const ALT_SCREEN_EXIT: &str = "\x1b[?1049l";
 const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
+const HIDE_CURSOR: &str = "\x1b[?25l";
+const SHOW_CURSOR: &str = "\x1b[?25h";
+const BOLD: &str = "\x1b[1m";
+const ACCENT: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
@@ -57,31 +61,61 @@ pub fn run() -> StayResult<()> {
             print_usage();
             Ok(())
         }
+        [flag] if is_help_flag(flag) => {
+            print_usage();
+            Ok(())
+        }
         [flag] if flag == "--version" || flag == "-V" => {
             println!("stay {VERSION}");
+            Ok(())
+        }
+        [cmd, flag] if cmd == "ls" && is_help_flag(flag) => {
+            print_ls_usage();
             Ok(())
         }
         [cmd] if cmd == "ls" => {
             ensure_daemon()?;
             list_sessions()
         }
+        [cmd, ..] if cmd == "ls" => Err(StayError::new("Usage: stay ls")),
         [cmd] if cmd == "completions" || cmd == "completion" => {
             print_completion_usage();
             Ok(())
         }
+        [cmd, flag] if (cmd == "completions" || cmd == "completion") && is_help_flag(flag) => {
+            print_completion_usage();
+            Ok(())
+        }
         [cmd, shell] if cmd == "completions" || cmd == "completion" => print_completions(shell),
+        [cmd, ..] if cmd == "completions" || cmd == "completion" => {
+            Err(StayError::new("Usage: stay completions <bash|zsh|fish>"))
+        }
+        [cmd, flag] if cmd == "kill" && is_help_flag(flag) => {
+            print_kill_usage();
+            Ok(())
+        }
         [cmd, name] if cmd == "kill" => {
             validate_session_name(name).map_err(StayError::new)?;
             ensure_daemon()?;
             simple_request(Request::Kill { name: name.clone() })
+        }
+        [cmd, ..] if cmd == "kill" => Err(StayError::new("Usage: stay kill <name>")),
+        [cmd, flag] if cmd == "rm" && is_help_flag(flag) => {
+            print_rm_usage();
+            Ok(())
         }
         [cmd, name] if cmd == "rm" => {
             validate_session_name(name).map_err(StayError::new)?;
             ensure_daemon()?;
             simple_request(Request::Remove { name: name.clone() })
         }
+        [cmd, ..] if cmd == "rm" => Err(StayError::new("Usage: stay rm <name>")),
         _ => attach_command(args),
     }
+}
+
+fn is_help_flag(arg: &str) -> bool {
+    arg == "--help" || arg == "-h"
 }
 
 fn attach_command(args: Vec<String>) -> StayResult<()> {
@@ -112,6 +146,24 @@ fn print_usage() {
     println!("  stay kill <name>");
     println!("  stay rm <name>");
     println!("  stay completions <bash|zsh|fish>");
+}
+
+fn print_ls_usage() {
+    println!("Usage: stay ls");
+    println!();
+    println!("List sessions.");
+}
+
+fn print_kill_usage() {
+    println!("Usage: stay kill <name>");
+    println!();
+    println!("Kill a running session.");
+}
+
+fn print_rm_usage() {
+    println!("Usage: stay rm <name>");
+    println!();
+    println!("Remove a stopped session.");
 }
 
 fn run_daemon() -> StayResult<()> {
@@ -165,8 +217,7 @@ fn handle_client(mut stream: UnixStream, sessions: Sessions, paths: Paths) -> St
             stream, sessions, paths, name, cwd, command, restart, rows, cols,
         ),
         Request::Kill { name } => {
-            let message = kill_session(&name, &sessions, &paths)?;
-            write_response(&mut stream, &Response::Ok { message })
+            write_command_result(&mut stream, kill_session(&name, &sessions, &paths))
         }
         Request::List => {
             let mut sessions = sessions.lock().expect("sessions lock poisoned");
@@ -181,9 +232,20 @@ fn handle_client(mut stream: UnixStream, sessions: Sessions, paths: Paths) -> St
             write_response(&mut stream, &Response::Sessions { sessions: list })
         }
         Request::Remove { name } => {
-            let message = remove_session(&name, &sessions, &paths)?;
-            write_response(&mut stream, &Response::Ok { message })
+            write_command_result(&mut stream, remove_session(&name, &sessions, &paths))
         }
+    }
+}
+
+fn write_command_result(stream: &mut UnixStream, result: StayResult<String>) -> StayResult<()> {
+    match result {
+        Ok(message) => write_response(stream, &Response::Ok { message }),
+        Err(err) => write_response(
+            stream,
+            &Response::Error {
+                message: err.to_string(),
+            },
+        ),
     }
 }
 
@@ -599,10 +661,11 @@ fn run_raw_client(mut stream: UnixStream, name: &str, message: &str) -> StayResu
     let mut guard = TerminalGuard {
         fd_termios: Some((stdin.as_raw_fd(), original)),
         in_world: false,
+        world_name: name.to_string(),
     };
 
-    enter_world(name, message)?;
     guard.in_world = true;
+    enter_world(name, message)?;
 
     let mut raw = guard
         .fd_termios
@@ -683,6 +746,7 @@ fn run_raw_client(mut stream: UnixStream, name: &str, message: &str) -> StayResu
 struct TerminalGuard {
     fd_termios: Option<(i32, Termios)>,
     in_world: bool,
+    world_name: String,
 }
 
 impl Drop for TerminalGuard {
@@ -692,19 +756,80 @@ impl Drop for TerminalGuard {
             let _ = tcsetattr(borrowed, SetArg::TCSANOW, &termios);
         }
         if self.in_world {
-            print!("{ALT_SCREEN_EXIT}");
+            let _ = play_pixel_transition(&self.world_name, false);
+            print!("{ALT_SCREEN_EXIT}{SHOW_CURSOR}");
             let _ = io::stdout().flush();
         }
     }
 }
 
 fn enter_world(name: &str, message: &str) -> StayResult<()> {
-    print!("{ALT_SCREEN_ENTER}{CLEAR_SCREEN}");
-    println!("{DIM}stay:{name}  |  Ctrl+A to return{RESET}");
+    print!("{ALT_SCREEN_ENTER}");
+    play_pixel_transition(name, true)?;
+    print!("{CLEAR_SCREEN}");
+    println!("{DIM}stay:{name}  |  inside  |  Ctrl+A to return{RESET}");
     if !message.is_empty() {
         print!("{message}");
     } else {
         println!();
+    }
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn play_pixel_transition(name: &str, entering: bool) -> StayResult<()> {
+    let label = if entering {
+        format!("inside: {name}")
+    } else {
+        "outside".to_string()
+    };
+    let frames = if entering {
+        [0_usize, 1, 2, 3, 4, 5, 6, 7, 8]
+    } else {
+        [8_usize, 7, 6, 5, 4, 3, 2, 1, 0]
+    };
+
+    for frame in frames {
+        draw_pixel_frame(&label, frame, 8)?;
+        thread::sleep(Duration::from_millis(60));
+    }
+
+    print!("{SHOW_CURSOR}");
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn draw_pixel_frame(label: &str, frame: usize, max_frame: usize) -> StayResult<()> {
+    let (rows, cols) = terminal_size();
+    let available_width = (cols as usize).saturating_sub(4).max(1);
+    let available_height = (rows as usize).saturating_sub(6).max(1);
+    let max_width = available_width
+        .min(72)
+        .max(label.len().min(available_width));
+    let max_height = available_height.min(11).max(1);
+    let width = 1 + max_width.saturating_sub(1) * frame / max_frame.max(1);
+    let height = 1 + max_height.saturating_sub(1) * frame / max_frame.max(1);
+    let row = ((rows as usize).saturating_sub(height) / 2).max(1);
+    let col = ((cols as usize).saturating_sub(width) / 2).max(1);
+    let label_col = ((cols as usize).saturating_sub(label.len()) / 2).max(1);
+
+    print!("{HIDE_CURSOR}{CLEAR_SCREEN}");
+    print!(
+        "\x1b[{};{}H{DIM}{label}{RESET}",
+        row.saturating_sub(2).max(1),
+        label_col
+    );
+
+    for offset in 0..height {
+        let edge = offset == 0 || offset + 1 == height;
+        let line = if edge {
+            "#".repeat(width)
+        } else if width > 2 {
+            format!("#{}#", " ".repeat(width - 2))
+        } else {
+            "#".repeat(width)
+        };
+        print!("\x1b[{};{}H{ACCENT}{BOLD}{line}{RESET}", row + offset, col);
     }
     io::stdout().flush()?;
     Ok(())
@@ -720,7 +845,7 @@ fn list_sessions() -> StayResult<()> {
                 println!(
                     "{:<16}{:<10}{}",
                     session.name,
-                    session.state,
+                    session.state.to_string(),
                     display_command(&session.command)
                 );
             }
