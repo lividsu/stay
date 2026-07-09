@@ -21,8 +21,9 @@ Compared with `screen`, Stay keeps the workflow smaller:
 - Smart tab completion: shell completions can suggest existing session names.
 - Drag selection: select text inside Stay's alternate screen, including dragging
   to the top or bottom edge to keep scrolling through history.
-- Persistent records: after a reboot, running tasks are gone, but Stay keeps the
-  session name, working directory, and last command so you can restart cleanly.
+- Persistent records: Stay keeps each session's replay history on disk. If a
+  task exits, `stay <name>` opens the saved scrollback first; leave with Ctrl+A,
+  then press Enter if you want to restart the last command.
 - Tiny footprint: Stay is a small local daemon with one PTY per active session,
   and it does almost nothing while your task runs.
 
@@ -53,7 +54,7 @@ stay rm <name>
 stay completions <bash|zsh|fish>
 ```
 
-Session state is stored under `~/.local/state/stay/`.
+Session state and saved scrollback are stored under `~/.local/state/stay/`.
 
 ## Install
 

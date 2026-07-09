@@ -11,7 +11,7 @@ use nix::unistd::{read as nix_read, setsid, write as nix_write, Pid};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd};
@@ -57,6 +57,7 @@ const AUTO_SCROLL_INTERVAL_MS: u16 = 60;
 struct Paths {
     state_dir: PathBuf,
     sessions_dir: PathBuf,
+    histories_dir: PathBuf,
     daemon_socket: PathBuf,
 }
 
@@ -78,34 +79,68 @@ type SharedIo = Arc<Mutex<SessionIo>>;
 struct SessionIo {
     buffer: Vec<u8>,
     subscriber: Option<UnixStream>,
+    history_path: Option<PathBuf>,
 }
 
 impl SessionIo {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_history(None, Vec::new())
+    }
+
+    fn with_history(history_path: Option<PathBuf>, mut buffer: Vec<u8>) -> Self {
+        trim_scrollback(&mut buffer);
         Self {
-            buffer: Vec::new(),
+            buffer,
             subscriber: None,
+            history_path,
         }
     }
 
-    fn shared() -> SharedIo {
-        Arc::new(Mutex::new(Self::new()))
+    fn shared_with_history(history_path: PathBuf, buffer: Vec<u8>) -> SharedIo {
+        Arc::new(Mutex::new(Self::with_history(Some(history_path), buffer)))
     }
 
     /// Append a chunk of PTY output to the replay buffer, capped to the most
     /// recent `SCROLLBACK_LIMIT` bytes and trimmed at a line boundary.
     fn record(&mut self, chunk: &[u8]) {
         self.buffer.extend_from_slice(chunk);
-
-        if self.buffer.len() > SCROLLBACK_LIMIT {
-            let overflow = self.buffer.len() - SCROLLBACK_LIMIT;
-            let mut cut = overflow;
-            if let Some(nl) = self.buffer[cut..].iter().position(|byte| *byte == b'\n') {
-                cut += nl + 1;
-            }
-            self.buffer.drain(..cut.min(self.buffer.len()));
-        }
+        let trimmed = trim_scrollback(&mut self.buffer);
+        self.persist(chunk, trimmed);
     }
+
+    fn persist(&self, chunk: &[u8], rewrite: bool) {
+        let Some(path) = self.history_path.as_ref() else {
+            return;
+        };
+
+        let result = if rewrite {
+            fs::write(path, &self.buffer)
+        } else {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(chunk))
+        };
+        // Keep the live session healthy even if the scrollback file cannot be
+        // updated (for example, a full disk).
+        let _ = result;
+    }
+}
+
+fn trim_scrollback(buffer: &mut Vec<u8>) -> bool {
+    if buffer.len() <= SCROLLBACK_LIMIT {
+        return false;
+    }
+
+    let overflow = buffer.len() - SCROLLBACK_LIMIT;
+    let mut cut = overflow;
+    if let Some(nl) = buffer[cut..].iter().position(|byte| *byte == b'\n') {
+        cut += nl + 1;
+    }
+    buffer.drain(..cut.min(buffer.len()));
+    true
 }
 
 /// Remove `ESC [ 3 J`, which clears terminal scrollback. The visible-screen
@@ -345,11 +380,22 @@ fn handle_attach(
     rows: u16,
     cols: u16,
 ) -> StayResult<()> {
+    enum AttachKind {
+        Live {
+            message: String,
+        },
+        History {
+            state: SessionState,
+            exit_code: Option<i32>,
+            command: Vec<String>,
+        },
+    }
+
     let mut start_command = command.clone().unwrap_or_else(shell_command);
     let mut start_cwd = cwd.clone();
     let mut message = String::new();
 
-    {
+    let attach_kind = {
         let mut sessions_guard = sessions.lock().expect("sessions lock poisoned");
         if let Some(existing) = sessions_guard.get_mut(&name) {
             refresh_record_state(&mut existing.record);
@@ -382,17 +428,38 @@ fn handle_attach(
                     }
                     existing.record.last_attached_at = Some(now());
                     write_record(&paths, &existing.record)?;
+                    AttachKind::Live { message }
                 }
                 SessionState::Exited | SessionState::Stopped if !restart => {
-                    return write_response(
-                        &mut stream,
-                        &Response::NeedsRestart {
-                            name,
-                            state: existing.record.state.clone(),
-                            exit_code: existing.record.exit_code,
-                            command: existing.record.command.clone(),
-                        },
-                    );
+                    if existing.attached {
+                        return write_response(
+                            &mut stream,
+                            &Response::Error {
+                                message: format!("Session {name} is already attached."),
+                            },
+                        );
+                    }
+
+                    if !has_recorded_history(&existing.io) {
+                        return write_response(
+                            &mut stream,
+                            &Response::NeedsRestart {
+                                name,
+                                state: existing.record.state.clone(),
+                                exit_code: existing.record.exit_code,
+                                command: existing.record.command.clone(),
+                            },
+                        );
+                    }
+
+                    existing.record.last_attached_at = Some(now());
+                    write_record(&paths, &existing.record)?;
+
+                    AttachKind::History {
+                        state: existing.record.state.clone(),
+                        exit_code: existing.record.exit_code,
+                        command: existing.record.command.clone(),
+                    }
                 }
                 SessionState::Exited | SessionState::Stopped => {
                     start_command = if let Some(command) = command {
@@ -407,6 +474,7 @@ fn handle_attach(
                     existing.master = Some(master);
                     existing.io = io;
                     existing.attached = false;
+                    AttachKind::Live { message }
                 }
             }
         } else {
@@ -421,11 +489,38 @@ fn handle_attach(
                     attached: false,
                 },
             );
+            AttachKind::Live { message }
+        }
+    };
+
+    match attach_kind {
+        AttachKind::Live { message } => {
+            write_response(&mut stream, &Response::AttachReady { message })?;
+            attach_stream(name, stream, sessions)
+        }
+        AttachKind::History {
+            state,
+            exit_code,
+            command,
+        } => {
+            write_response(
+                &mut stream,
+                &Response::HistoryReady {
+                    state,
+                    exit_code,
+                    command,
+                },
+            )?;
+            attach_history_stream(name, stream, sessions)
         }
     }
+}
 
-    write_response(&mut stream, &Response::AttachReady { message })?;
-    attach_stream(name, stream, sessions)
+fn has_recorded_history(io: &SharedIo) -> bool {
+    !io.lock()
+        .expect("session io lock poisoned")
+        .buffer
+        .is_empty()
 }
 
 fn attach_stream(name: String, mut stream: UnixStream, sessions: Sessions) -> StayResult<()> {
@@ -456,6 +551,35 @@ fn attach_stream(name: String, mut stream: UnixStream, sessions: Sessions) -> St
     result
 }
 
+fn attach_history_stream(
+    name: String,
+    mut stream: UnixStream,
+    sessions: Sessions,
+) -> StayResult<()> {
+    let io = {
+        let mut sessions_guard = sessions.lock().expect("sessions lock poisoned");
+        let session = sessions_guard
+            .get_mut(&name)
+            .ok_or_else(|| StayError::new(format!("Session not found: {name}")))?;
+        if session.attached {
+            return Err(StayError::new(format!(
+                "Session {name} is already attached."
+            )));
+        }
+        session.attached = true;
+        Arc::clone(&session.io)
+    };
+
+    let result = serve_history(&mut stream, &io);
+
+    let mut sessions_guard = sessions.lock().expect("sessions lock poisoned");
+    if let Some(session) = sessions_guard.get_mut(&name) {
+        session.attached = false;
+    }
+
+    result
+}
+
 /// Replay recorded history, then subscribe to live output and forward input.
 ///
 /// The replay and the subscription happen together under the io lock so the
@@ -470,6 +594,29 @@ fn serve_attached(stream: &mut UnixStream, master: &File, io: &SharedIo) -> Stay
     }
 
     pump_input(stream, master)
+}
+
+/// Replay saved history without a live PTY. The client still handles scrolling,
+/// selection, and Ctrl+A locally, while this side just keeps the connection open
+/// until the user leaves the history view.
+fn serve_history(stream: &mut UnixStream, io: &SharedIo) -> StayResult<()> {
+    {
+        let io_guard = io.lock().expect("session io lock poisoned");
+        stream.write_all(&io_guard.buffer)?;
+        stream.flush()?;
+    }
+
+    let mut discard = [0_u8; 8192];
+    loop {
+        match stream.read(&mut discard) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(())
 }
 
 /// Forward client keystrokes to the PTY. Live PTY output flows the other way
@@ -560,10 +707,11 @@ fn spawn_session(
         exit_code: None,
     };
     write_record(paths, &record)?;
+    reset_history(paths, name)?;
 
     // Continuously drain the PTY into a replay buffer, even while detached, so
     // background output is never lost and can be replayed on the next attach.
-    let io = SessionIo::shared();
+    let io = SessionIo::shared_with_history(history_path(paths, name), Vec::new());
     let reader_master = master.try_clone()?;
     let reader_io = Arc::clone(&io);
     thread::spawn(move || run_pty_reader(reader_master, reader_io));
@@ -674,6 +822,7 @@ fn remove_session(name: &str, sessions: &Sessions, paths: &Paths) -> StayResult<
     if record_path.exists() {
         fs::remove_file(record_path)?;
     }
+    remove_history(paths, name)?;
 
     Ok(format!("Removed {name}."))
 }
@@ -753,37 +902,66 @@ fn attach(name: &str, command: Option<Vec<String>>, restart: bool) -> StayResult
     let response = read_response(&stream)?;
     match response {
         Response::AttachReady { message } => run_raw_client(stream, name, &message),
+        Response::HistoryReady {
+            state,
+            exit_code,
+            command,
+        } => {
+            run_raw_history_client(stream, name)?;
+            prompt_restart(name, state, exit_code, command)
+        }
         Response::NeedsRestart {
             state,
             exit_code,
             command,
             ..
-        } => {
-            match state {
-                SessionState::Stopped => println!("Session {name} is stopped."),
-                SessionState::Exited => match exit_code {
-                    Some(code) => println!("Session {name} has exited with code {code}."),
-                    None => println!("Session {name} has exited."),
-                },
-                SessionState::Running => {}
-            }
-            println!();
-            if !command.is_empty() {
-                println!("Last command:");
-                println!("{}", display_command(&command));
-                println!();
-            }
-            println!("Press Enter to run again, or Ctrl+C to cancel.");
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            attach(name, command.into(), true)
-        }
+        } => prompt_restart(name, state, exit_code, command),
         Response::Error { message } => Err(StayError::new(message)),
         other => Err(StayError::new(format!("Unexpected response: {other:?}"))),
     }
 }
 
+fn prompt_restart(
+    name: &str,
+    state: SessionState,
+    exit_code: Option<i32>,
+    command: Vec<String>,
+) -> StayResult<()> {
+    match state {
+        SessionState::Stopped => println!("Session {name} is stopped."),
+        SessionState::Exited => match exit_code {
+            Some(code) => println!("Session {name} has exited with code {code}."),
+            None => println!("Session {name} has exited."),
+        },
+        SessionState::Running => {}
+    }
+    println!();
+    if !command.is_empty() {
+        println!("Last command:");
+        println!("{}", display_command(&command));
+        println!();
+    }
+    println!("Press Enter to run again, or Ctrl+C to cancel.");
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    attach(name, command.into(), true)
+}
+
 fn run_raw_client(mut stream: UnixStream, name: &str, _message: &str) -> StayResult<()> {
+    run_raw_client_mode(&mut stream, name, ClientMode::Live)
+}
+
+fn run_raw_history_client(mut stream: UnixStream, name: &str) -> StayResult<()> {
+    run_raw_client_mode(&mut stream, name, ClientMode::History)
+}
+
+#[derive(Clone, Copy)]
+enum ClientMode {
+    Live,
+    History,
+}
+
+fn run_raw_client_mode(stream: &mut UnixStream, name: &str, mode: ClientMode) -> StayResult<()> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
     let original = tcgetattr(stdin_fd).map_err(|err| StayError::new(err.to_string()))?;
@@ -853,7 +1031,7 @@ fn run_raw_client(mut stream: UnixStream, name: &str, _message: &str) -> StayRes
             view.feed(&output_buffer[..read]);
             // Coalesce a burst (e.g. the whole history replayed on attach) into a
             // single repaint instead of flickering through it chunk by chunk.
-            while stream_has_input(&stream)? {
+            while stream_has_input(stream)? {
                 let more = stream.read(&mut output_buffer)?;
                 if more == 0 {
                     break;
@@ -881,7 +1059,7 @@ fn run_raw_client(mut stream: UnixStream, name: &str, _message: &str) -> StayRes
         }
         if handle_client_input(
             &mut view,
-            &mut stream,
+            stream,
             &mut out,
             &mut pending_input,
             &input_buffer[..read],
@@ -894,8 +1072,13 @@ fn run_raw_client(mut stream: UnixStream, name: &str, _message: &str) -> StayRes
 
     drop(guard);
     if detached {
-        println!("Returned from {name}.");
-        println!("Reattach with: stay {name}");
+        match mode {
+            ClientMode::Live => {
+                println!("Returned from {name}.");
+                println!("Reattach with: stay {name}");
+            }
+            ClientMode::History => println!("Closed history for {name}."),
+        }
     }
 
     Ok(())
@@ -1625,8 +1808,10 @@ fn prepare_paths() -> StayResult<Paths> {
         .unwrap_or_else(|| home.join(".local/state"))
         .join("stay");
     let sessions_dir = state_dir.join("sessions");
+    let histories_dir = state_dir.join("history");
     let sockets_dir = state_dir.join("sockets");
     fs::create_dir_all(&sessions_dir)?;
+    fs::create_dir_all(&histories_dir)?;
     fs::create_dir_all(&sockets_dir)?;
     fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))?;
 
@@ -1634,6 +1819,7 @@ fn prepare_paths() -> StayResult<Paths> {
         daemon_socket: sockets_dir.join("daemon.sock"),
         state_dir,
         sessions_dir,
+        histories_dir,
     })
 }
 
@@ -1655,12 +1841,14 @@ fn load_records(paths: &Paths) -> StayResult<HashMap<String, ManagedSession>> {
             record.pid = None;
             write_record(paths, &record)?;
         }
+        let history = read_history(paths, &record.name)?;
+        let name = record.name.clone();
         sessions.insert(
-            record.name.clone(),
+            name.clone(),
             ManagedSession {
                 record,
                 master: None,
-                io: SessionIo::shared(),
+                io: SessionIo::shared_with_history(history_path(paths, &name), history),
                 attached: false,
             },
         );
@@ -1686,6 +1874,35 @@ fn write_record(paths: &Paths, record: &SessionRecord) -> StayResult<()> {
 
 fn session_path(paths: &Paths, name: &str) -> PathBuf {
     paths.sessions_dir.join(format!("{name}.json"))
+}
+
+fn history_path(paths: &Paths, name: &str) -> PathBuf {
+    paths.histories_dir.join(format!("{name}.scrollback"))
+}
+
+fn read_history(paths: &Paths, name: &str) -> StayResult<Vec<u8>> {
+    let path = history_path(paths, name);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut buffer = fs::read(&path)?;
+    if trim_scrollback(&mut buffer) {
+        fs::write(&path, &buffer)?;
+    }
+    Ok(buffer)
+}
+
+fn reset_history(paths: &Paths, name: &str) -> StayResult<()> {
+    remove_history(paths, name)
+}
+
+fn remove_history(paths: &Paths, name: &str) -> StayResult<()> {
+    let path = history_path(paths, name);
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 /// Resize the session's PTY to the attaching terminal. The kernel delivers
@@ -1897,6 +2114,17 @@ mod tests {
     }
 
     #[test]
+    fn record_persists_output_for_replay() {
+        let (dir, path) = temp_history_path("persist");
+        let mut io = SessionIo::with_history(Some(path.clone()), Vec::new());
+        io.record(b"log line 1\n");
+        io.record(b"log line 2\n");
+
+        assert_eq!(fs::read(&path).unwrap(), b"log line 1\nlog line 2\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn strip_clear_scrollback_removes_all_sequences_in_chunk() {
         assert_eq!(
             strip_clear_scrollback(b"a\x1b[3Jb\x1b[3Jc").as_ref(),
@@ -1917,6 +2145,23 @@ mod tests {
         // so the buffer still begins and ends with a whole line.
         assert!(io.buffer.starts_with(b"a line of text\n"));
         assert!(io.buffer.ends_with(b"a line of text\n"));
+    }
+
+    #[test]
+    fn record_rewrites_persisted_history_after_trim() {
+        let (dir, path) = temp_history_path("trim");
+        let mut io = SessionIo::with_history(Some(path.clone()), Vec::new());
+        let mut blob = Vec::new();
+        while blob.len() <= SCROLLBACK_LIMIT {
+            blob.extend_from_slice(b"a line of text\n");
+        }
+
+        io.record(&blob);
+
+        let persisted = fs::read(&path).unwrap();
+        assert_eq!(persisted, io.buffer);
+        assert!(persisted.len() <= SCROLLBACK_LIMIT);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1975,5 +2220,17 @@ mod tests {
         assert_eq!(base64_encode(b"f"), "Zg==");
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
+    }
+
+    fn temp_history_path(label: &str) -> (PathBuf, PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            env::temp_dir().join(format!("stay-test-{}-{label}-{unique}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.scrollback");
+        (dir, path)
     }
 }

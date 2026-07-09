@@ -97,6 +97,11 @@ pub enum Response {
     Error {
         message: String,
     },
+    HistoryReady {
+        state: SessionState,
+        exit_code: Option<i32>,
+        command: Vec<String>,
+    },
     NeedsRestart {
         name: String,
         state: SessionState,
