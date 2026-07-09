@@ -4,8 +4,8 @@ A tiny terminal session keeper for Linux.
 
 Run a command, press Ctrl+A to leave, come back with `stay <name>`.
 Stay opens the session in its own screen and renders it through a small built-in
-terminal emulator, so the scroll wheel pages back through the session's history
-just like a normal terminal.
+terminal view, so history, wheel scrolling, and drag selection keep working
+inside the alternate screen.
 
 ## Why Stay
 
@@ -15,12 +15,12 @@ task running after SSH disconnects.
 Compared with `screen`, Stay keeps the workflow smaller:
 
 - Easy commands: use `stay api`, `stay ls`, `stay kill api`, and `stay rm api`.
-- Wheel scrollback: `stay api` reprints the session with a brief animated
-  hand-off, then the scroll wheel pages back through everything it printed.
+- Alternate-screen scrollback: `stay api` reprints the session with a brief
+  animated hand-off, then the scroll wheel pages back through everything it
+  printed.
 - Smart tab completion: shell completions can suggest existing session names.
-- Copy with a modifier: Stay captures the wheel to drive its own scrollback, so
-  hold Shift (Option on macOS/iTerm) and drag to select text with your
-  terminal's native selection.
+- Drag selection: select text inside Stay's alternate screen, including dragging
+  to the top or bottom edge to keep scrolling through history.
 - Persistent records: after a reboot, running tasks are gone, but Stay keeps the
   session name, working directory, and last command so you can restart cleanly.
 - Tiny footprint: Stay is a small local daemon with one PTY per active session,

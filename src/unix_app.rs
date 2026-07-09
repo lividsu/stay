@@ -8,6 +8,7 @@ use nix::pty::{openpty, OpenptyResult, Winsize};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg, Termios};
 use nix::unistd::{read as nix_read, setsid, write as nix_write, Pid};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
@@ -29,14 +30,17 @@ const ALT_SCREEN_EXIT: &str = "\x1b[?1049l";
 const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
 const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
-/// Enable SGR mouse reporting so the client can capture the scroll wheel.
-const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+/// Enable SGR mouse reporting with drag motion so Stay can provide scrollback
+/// and selection inside the alternate screen.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 /// Turn off the mouse reporting enabled by `MOUSE_ON`.
-const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 const BOLD: &str = "\x1b[1m";
 const ACCENT: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
+const INVERT_ON: &str = "\x1b[7m";
+const INVERT_OFF: &str = "\x1b[27m";
 
 /// Delay between transition animation frames. Lower is faster.
 const FRAME_DELAY_MS: u64 = 36;
@@ -46,6 +50,8 @@ const SCROLLBACK_LIMIT: usize = 2 * 1024 * 1024;
 const SCROLLBACK_LINES: usize = 10_000;
 /// Lines moved per wheel notch.
 const SCROLL_STEP: usize = 3;
+/// How often drag-selection scrolls while the pointer is held at an edge.
+const AUTO_SCROLL_INTERVAL_MS: u16 = 60;
 
 #[derive(Clone)]
 struct Paths {
@@ -86,19 +92,10 @@ impl SessionIo {
         Arc::new(Mutex::new(Self::new()))
     }
 
-    /// Append a chunk of PTY output to the replay buffer.
-    ///
-    /// An explicit "clear scrollback" (ESC [ 3 J), which `clear` emits on
-    /// terminals that support it, drops the earlier history so a cleared screen
-    /// stays cleared on the next attach. The buffer is otherwise capped to the
-    /// most recent `SCROLLBACK_LIMIT` bytes, trimmed at a line boundary.
+    /// Append a chunk of PTY output to the replay buffer, capped to the most
+    /// recent `SCROLLBACK_LIMIT` bytes and trimmed at a line boundary.
     fn record(&mut self, chunk: &[u8]) {
-        if let Some(pos) = last_clear_scrollback(chunk) {
-            self.buffer.clear();
-            self.buffer.extend_from_slice(&chunk[pos..]);
-        } else {
-            self.buffer.extend_from_slice(chunk);
-        }
+        self.buffer.extend_from_slice(chunk);
 
         if self.buffer.len() > SCROLLBACK_LIMIT {
             let overflow = self.buffer.len() - SCROLLBACK_LIMIT;
@@ -111,15 +108,29 @@ impl SessionIo {
     }
 }
 
-/// Index of the ESC starting the last `ESC [ 3 J` sequence in `chunk`, if any.
-fn last_clear_scrollback(chunk: &[u8]) -> Option<usize> {
+/// Remove `ESC [ 3 J`, which clears terminal scrollback. The visible-screen
+/// clear (`ESC [ 2 J`) is left intact, but Stay keeps prior output available on
+/// reattach instead of letting a shell `clear` erase the replay history.
+fn strip_clear_scrollback(chunk: &[u8]) -> Cow<'_, [u8]> {
     const SEQ: &[u8] = b"\x1b[3J";
     if chunk.len() < SEQ.len() {
-        return None;
+        return Cow::Borrowed(chunk);
     }
-    (0..=chunk.len() - SEQ.len())
-        .rev()
-        .find(|&index| &chunk[index..index + SEQ.len()] == SEQ)
+    if !chunk.windows(SEQ.len()).any(|window| window == SEQ) {
+        return Cow::Borrowed(chunk);
+    }
+
+    let mut filtered = Vec::with_capacity(chunk.len());
+    let mut i = 0;
+    while i < chunk.len() {
+        if chunk[i..].starts_with(SEQ) {
+            i += SEQ.len();
+        } else {
+            filtered.push(chunk[i]);
+            i += 1;
+        }
+    }
+    Cow::Owned(filtered)
 }
 
 pub fn run() -> StayResult<()> {
@@ -581,11 +592,14 @@ fn run_pty_reader(master: File, io: SharedIo) {
         match nix_read(master.as_raw_fd(), &mut buffer) {
             Ok(0) => break,
             Ok(read) => {
-                let chunk = &buffer[..read];
+                let chunk = strip_clear_scrollback(&buffer[..read]);
+                if chunk.is_empty() {
+                    continue;
+                }
                 let mut io_guard = io.lock().expect("session io lock poisoned");
-                io_guard.record(chunk);
+                io_guard.record(&chunk);
                 if let Some(subscriber) = io_guard.subscriber.as_mut() {
-                    if subscriber.write_all(chunk).is_err() {
+                    if subscriber.write_all(&chunk).is_err() {
                         io_guard.subscriber = None;
                     }
                 }
@@ -811,7 +825,17 @@ fn run_raw_client(mut stream: UnixStream, name: &str, _message: &str) -> StayRes
                     PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
                 ),
             ];
-            poll(&mut fds, PollTimeout::NONE).map_err(|err| StayError::new(err.to_string()))?;
+            let timeout = if view.auto_scroll_direction().is_some() {
+                PollTimeout::from(AUTO_SCROLL_INTERVAL_MS)
+            } else {
+                PollTimeout::NONE
+            };
+            let ready = poll(&mut fds, timeout).map_err(|err| StayError::new(err.to_string()))?;
+            if ready == 0 {
+                view.auto_scroll_selection(&mut out)?;
+                out.flush()?;
+                continue;
+            }
             (
                 fds[0].revents().unwrap_or(PollFlags::empty()),
                 fds[1].revents().unwrap_or(PollFlags::empty()),
@@ -838,7 +862,7 @@ fn run_raw_client(mut stream: UnixStream, name: &str, _message: &str) -> StayRes
             }
             // While scrolled up, keep the frozen view; new output stays buffered
             // and shows when the user scrolls back down.
-            if view.is_live() {
+            if view.is_live() || view.selection_visible() {
                 view.paint(&mut out)?;
                 out.flush()?;
             }
@@ -878,12 +902,15 @@ fn run_raw_client(mut stream: UnixStream, name: &str, _message: &str) -> StayRes
 }
 
 /// Client-side terminal emulator. Session output is fed into a `vt100` grid so
-/// the alternate screen gains real scrollback: live output is drawn as a minimal
-/// diff, and the wheel repaints from the grid's scrollback.
+/// the alternate screen gains its own scrollback. Stay also draws a lightweight
+/// selection overlay on top of that grid because terminal-native selection
+/// cannot see this virtual scrollback.
 struct Screenview {
     parser: vt100::Parser,
     prev: vt100::Screen,
     scroll: usize,
+    selection: Option<Selection>,
+    overlay_drawn: bool,
 }
 
 impl Screenview {
@@ -894,6 +921,8 @@ impl Screenview {
             parser,
             prev,
             scroll: 0,
+            selection: None,
+            overlay_drawn: false,
         }
     }
 
@@ -901,53 +930,363 @@ impl Screenview {
         self.scroll == 0
     }
 
+    fn selection_visible(&self) -> bool {
+        self.selection.is_some_and(|selection| selection.moved)
+    }
+
     fn feed(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
     }
 
-    /// Draw the current view (live or scrolled) as a diff against what is
-    /// already on screen, so only changed cells are rewritten.
+    /// Draw the current view (live or scrolled). With no selection, this is a
+    /// diff against the previous grid; with a selection, it repaints the visible
+    /// screen and overlays inverse-video selected spans.
     fn paint(&mut self, out: &mut impl Write) -> io::Result<()> {
         self.parser.screen_mut().set_scrollback(self.scroll);
-        let diff = self.parser.screen().contents_diff(&self.prev);
-        out.write_all(&diff)?;
-        self.prev = self.parser.screen().clone();
+        self.scroll = self.parser.screen().scrollback();
+        let screen = self.parser.screen();
+
+        if self.selection_visible() || self.overlay_drawn {
+            out.write_all(&screen.contents_formatted())?;
+            if self.selection_visible() {
+                paint_selection_overlay(screen, self.scroll, self.selection, out)?;
+                self.overlay_drawn = true;
+            } else {
+                self.overlay_drawn = false;
+            }
+        } else {
+            let diff = screen.contents_diff(&self.prev);
+            out.write_all(&diff)?;
+        }
+
+        self.prev = screen.clone();
         Ok(())
     }
 
-    /// Move the scrollback view; `up` heads toward older output. The wheel can
-    /// keep scrolling at the edges, and `set_scrollback` clamps at the ends.
+    /// Move the scrollback view; `up` heads toward older output.
     fn scroll_view(&mut self, up: bool, out: &mut impl Write) -> io::Result<()> {
-        let was_live = self.is_live();
-        let target = if up {
-            self.scroll + SCROLL_STEP
-        } else {
-            self.scroll.saturating_sub(SCROLL_STEP)
-        };
-        self.parser.screen_mut().set_scrollback(target);
-        self.scroll = self.parser.screen().scrollback();
-        if was_live && !self.is_live() {
-            out.write_all(HIDE_CURSOR.as_bytes())?;
-        } else if !was_live && self.is_live() {
-            out.write_all(SHOW_CURSOR.as_bytes())?;
-        }
+        self.clear_selection();
+        self.scroll_by_rows(
+            if up {
+                SCROLL_STEP as isize
+            } else {
+                -(SCROLL_STEP as isize)
+            },
+            out,
+        )?;
         self.paint(out)
     }
 
     /// Snap back to the live bottom, the way typing in a normal terminal does.
     fn snap_to_live(&mut self, out: &mut impl Write) -> io::Result<()> {
+        self.clear_selection();
         if !self.is_live() {
             self.scroll = 0;
             out.write_all(SHOW_CURSOR.as_bytes())?;
             self.paint(out)?;
+        } else if self.overlay_drawn {
+            self.paint(out)?;
         }
         Ok(())
     }
+
+    fn start_selection(&mut self, row: u16, col: u16) {
+        let point = self.point_for_visible_cell(row, col);
+        self.selection = Some(Selection {
+            anchor: point,
+            focus: point,
+            dragging: true,
+            moved: false,
+            edge: self.edge_for_row(row),
+            last_col: col,
+        });
+    }
+
+    fn update_selection(&mut self, row: u16, col: u16) {
+        let focus = self.point_for_visible_cell(row, col);
+        let edge = self.edge_for_row(row);
+        if let Some(selection) = self.selection.as_mut() {
+            selection.focus = focus;
+            selection.moved |= selection.focus != selection.anchor;
+            selection.edge = edge;
+            selection.last_col = col;
+        }
+    }
+
+    fn finish_selection(&mut self) -> Option<String> {
+        if let Some(selection) = self.selection.as_mut() {
+            selection.dragging = false;
+            selection.edge = None;
+        }
+        if !self.selection_visible() {
+            self.selection = None;
+            return None;
+        }
+
+        let text = self.selected_text();
+        if text.is_empty() {
+            self.selection = None;
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    fn auto_scroll_direction(&self) -> Option<EdgeScroll> {
+        self.selection.and_then(|selection| {
+            if selection.dragging {
+                selection.edge
+            } else {
+                None
+            }
+        })
+    }
+
+    fn auto_scroll_selection(&mut self, out: &mut impl Write) -> io::Result<()> {
+        let Some(direction) = self.auto_scroll_direction() else {
+            return Ok(());
+        };
+        let delta = match direction {
+            EdgeScroll::Up => 1,
+            EdgeScroll::Down => -1,
+        };
+        if !self.scroll_by_rows(delta, out)? {
+            return Ok(());
+        }
+
+        let (rows, _) = self.parser.screen().size();
+        let row = match direction {
+            EdgeScroll::Up => 0,
+            EdgeScroll::Down => rows.saturating_sub(1),
+        };
+        let col = self.selection.map_or(0, |selection| selection.last_col);
+        self.update_selection(row, col);
+        self.paint(out)
+    }
+
+    fn scroll_by_rows(&mut self, delta: isize, out: &mut impl Write) -> io::Result<bool> {
+        let was_live = self.is_live();
+        let target = if delta >= 0 {
+            self.scroll.saturating_add(delta as usize)
+        } else {
+            self.scroll.saturating_sub(delta.unsigned_abs())
+        };
+
+        self.parser.screen_mut().set_scrollback(target);
+        let new_scroll = self.parser.screen().scrollback();
+        let changed = new_scroll != self.scroll;
+        self.scroll = new_scroll;
+
+        if was_live && !self.is_live() {
+            out.write_all(HIDE_CURSOR.as_bytes())?;
+        } else if !was_live && self.is_live() {
+            out.write_all(SHOW_CURSOR.as_bytes())?;
+        }
+
+        Ok(changed)
+    }
+
+    fn point_for_visible_cell(&self, row: u16, col: u16) -> SelectionPoint {
+        let (rows, cols) = self.parser.screen().size();
+        let row = row.min(rows.saturating_sub(1));
+        let col = col.min(cols.saturating_sub(1));
+        SelectionPoint {
+            row: row as isize - self.scroll as isize,
+            col,
+        }
+    }
+
+    fn edge_for_row(&self, row: u16) -> Option<EdgeScroll> {
+        let (rows, _) = self.parser.screen().size();
+        if row == 0 {
+            Some(EdgeScroll::Up)
+        } else if row >= rows.saturating_sub(1) {
+            Some(EdgeScroll::Down)
+        } else {
+            None
+        }
+    }
+
+    fn selected_text(&mut self) -> String {
+        let Some(selection) = self.selection else {
+            return String::new();
+        };
+        let Some((start, end)) = selection.ordered_bounds() else {
+            return String::new();
+        };
+
+        let saved_scroll = self.scroll;
+        let (_, cols) = self.parser.screen().size();
+        let mut text = String::new();
+
+        for row in start.row..=end.row {
+            let Some(visible_row) = self.make_history_row_visible(row) else {
+                continue;
+            };
+
+            let start_col = if row == start.row { start.col } else { 0 };
+            let end_col = if row == end.row {
+                end.col.saturating_add(1).min(cols)
+            } else {
+                cols
+            };
+
+            if start_col < end_col {
+                text.push_str(&self.visible_row_text(visible_row, start_col, end_col));
+            }
+            if row != end.row && !self.parser.screen().row_wrapped(visible_row) {
+                text.push('\n');
+            }
+        }
+
+        self.parser.screen_mut().set_scrollback(saved_scroll);
+        self.scroll = self.parser.screen().scrollback();
+        text
+    }
+
+    fn make_history_row_visible(&mut self, row: isize) -> Option<u16> {
+        let requested_scroll = if row < 0 { row.unsigned_abs() } else { 0 };
+        self.parser.screen_mut().set_scrollback(requested_scroll);
+        let actual_scroll = self.parser.screen().scrollback();
+        let visible_row = row + actual_scroll as isize;
+        let (rows, _) = self.parser.screen().size();
+        if (0..rows as isize).contains(&visible_row) {
+            Some(visible_row as u16)
+        } else {
+            None
+        }
+    }
+
+    fn visible_row_text(&self, row: u16, start_col: u16, end_col: u16) -> String {
+        self.parser
+            .screen()
+            .rows(start_col, end_col.saturating_sub(start_col))
+            .nth(usize::from(row))
+            .unwrap_or_default()
+    }
 }
 
-/// Feed raw stdin: intercept SGR mouse-wheel reports for scrolling, treat Ctrl+A
-/// (0x01) as detach, and forward everything else to the PTY. `pending` carries an
-/// unfinished mouse sequence split across reads. Returns `true` on detach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SelectionPoint {
+    row: isize,
+    col: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Selection {
+    anchor: SelectionPoint,
+    focus: SelectionPoint,
+    dragging: bool,
+    moved: bool,
+    edge: Option<EdgeScroll>,
+    last_col: u16,
+}
+
+impl Selection {
+    fn ordered_bounds(self) -> Option<(SelectionPoint, SelectionPoint)> {
+        if !self.moved {
+            return None;
+        }
+        if self.anchor <= self.focus {
+            Some((self.anchor, self.focus))
+        } else {
+            Some((self.focus, self.anchor))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeScroll {
+    Up,
+    Down,
+}
+
+fn paint_selection_overlay(
+    screen: &vt100::Screen,
+    scroll: usize,
+    selection: Option<Selection>,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let Some(selection) = selection else {
+        return Ok(());
+    };
+    let Some((start, end)) = selection.ordered_bounds() else {
+        return Ok(());
+    };
+
+    let (rows, cols) = screen.size();
+    for row in 0..rows {
+        let history_row = row as isize - scroll as isize;
+        let Some((start_col, end_col)) =
+            selected_span_for_visible_row(history_row, cols, start, end)
+        else {
+            continue;
+        };
+        let text = selected_cells_text(screen, row, start_col, end_col);
+        if text.is_empty() {
+            continue;
+        }
+        write!(
+            out,
+            "\x1b[{};{}H{}{}{}",
+            row + 1,
+            start_col + 1,
+            INVERT_ON,
+            text,
+            INVERT_OFF
+        )?;
+    }
+    write!(out, "{RESET}")?;
+    out.write_all(&screen.cursor_state_formatted())?;
+    Ok(())
+}
+
+fn selected_span_for_visible_row(
+    row: isize,
+    cols: u16,
+    start: SelectionPoint,
+    end: SelectionPoint,
+) -> Option<(u16, u16)> {
+    if row < start.row || row > end.row || cols == 0 {
+        return None;
+    }
+
+    let start_col = if row == start.row { start.col } else { 0 };
+    let end_col = if row == end.row {
+        end.col.saturating_add(1).min(cols)
+    } else {
+        cols
+    };
+
+    (start_col < end_col).then_some((start_col.min(cols), end_col))
+}
+
+fn selected_cells_text(screen: &vt100::Screen, row: u16, start_col: u16, end_col: u16) -> String {
+    let mut text = String::new();
+    for col in start_col..end_col {
+        let Some(cell) = screen.cell(row, col) else {
+            text.push(' ');
+            continue;
+        };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        if cell.has_contents() {
+            text.push_str(cell.contents());
+        } else {
+            text.push(' ');
+        }
+    }
+    text
+}
+
+/// Feed raw stdin: intercept SGR mouse reports for scrollback and selection,
+/// treat Ctrl+A (0x01) as detach, and forward everything else to the PTY.
+/// `pending` carries an unfinished mouse sequence split across reads.
 fn handle_client_input(
     view: &mut Screenview,
     stream: &mut UnixStream,
@@ -963,21 +1302,16 @@ fn handle_client_input(
     while i < data.len() {
         let byte = data[i];
 
-        // SGR mouse report: ESC [ < Cb ; Cx ; Cy (M|m). Capture the wheel; other
-        // mouse events are swallowed so they never reach the shell as garbage.
         if byte == 0x1b && data.get(i + 1) == Some(&b'[') && data.get(i + 2) == Some(&b'<') {
             if let Some(rel) = data[i + 3..].iter().position(|&c| c == b'M' || c == b'm') {
                 let term = i + 3 + rel;
-                if data[term] == b'M' {
-                    if let Some(up) = wheel_direction(&data[i + 3..term]) {
-                        flush_forward(view, stream, out, &mut forward)?;
-                        view.scroll_view(up, out)?;
-                    }
+                if let Some(report) = parse_mouse_report(&data[i + 3..term], data[term]) {
+                    flush_forward(view, stream, out, &mut forward)?;
+                    handle_mouse_report(view, out, report)?;
                 }
                 i = term + 1;
                 continue;
             }
-            // Terminator not here yet; resume once the rest of it arrives.
             *pending = data[i..].to_vec();
             break;
         }
@@ -997,8 +1331,6 @@ fn handle_client_input(
     Ok(false)
 }
 
-/// Send buffered keystrokes to the PTY, snapping the view to live first so any
-/// real input returns to the bottom like a normal terminal.
 fn flush_forward(
     view: &mut Screenview,
     stream: &mut UnixStream,
@@ -1014,15 +1346,60 @@ fn flush_forward(
     Ok(())
 }
 
-/// Decode an SGR mouse payload ("Cb;Cx;Cy"): `Some(true)` for wheel-up,
-/// `Some(false)` for wheel-down, `None` for any non-wheel button.
-fn wheel_direction(payload: &[u8]) -> Option<bool> {
-    let code: u16 = std::str::from_utf8(payload)
-        .ok()?
-        .split(';')
-        .next()?
-        .parse()
-        .ok()?;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MouseReport {
+    code: u16,
+    col: u16,
+    row: u16,
+    pressed: bool,
+}
+
+fn parse_mouse_report(payload: &[u8], terminator: u8) -> Option<MouseReport> {
+    let mut parts = std::str::from_utf8(payload).ok()?.split(';');
+    let code = parts.next()?.parse().ok()?;
+    let col = parts.next()?.parse::<u16>().ok()?.saturating_sub(1);
+    let row = parts.next()?.parse::<u16>().ok()?.saturating_sub(1);
+    Some(MouseReport {
+        code,
+        col,
+        row,
+        pressed: terminator == b'M',
+    })
+}
+
+fn handle_mouse_report(
+    view: &mut Screenview,
+    out: &mut impl Write,
+    report: MouseReport,
+) -> StayResult<()> {
+    if let Some(up) = mouse_wheel_direction(report.code) {
+        view.scroll_view(up, out)?;
+        return Ok(());
+    }
+
+    if !report.pressed {
+        if let Some(text) = view.finish_selection() {
+            write_osc52_clipboard(out, &text)?;
+        }
+        view.paint(out)?;
+        return Ok(());
+    }
+
+    let left_button = report.code & 0b11 == 0;
+    let motion = report.code & 0b0010_0000 != 0;
+
+    if left_button && motion {
+        view.update_selection(report.row, report.col);
+        view.paint(out)?;
+    } else if left_button {
+        view.start_selection(report.row, report.col);
+        view.paint(out)?;
+    }
+
+    Ok(())
+}
+
+fn mouse_wheel_direction(code: u16) -> Option<bool> {
     if code & 0b0100_0000 == 0 {
         return None;
     }
@@ -1031,6 +1408,39 @@ fn wheel_direction(payload: &[u8]) -> Option<bool> {
         1 => Some(false),
         _ => None,
     }
+}
+
+fn write_osc52_clipboard(out: &mut impl Write, text: &str) -> io::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    write!(out, "\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0];
+        let b = *chunk.get(1).unwrap_or(&0);
+        let c = *chunk.get(2).unwrap_or(&0);
+
+        encoded.push(TABLE[(a >> 2) as usize] as char);
+        encoded.push(TABLE[(((a & 0b0000_0011) << 4) | (b >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[(((b & 0b0000_1111) << 2) | (c >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(c & 0b0011_1111) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+
+    encoded
 }
 
 /// Non-blocking check for more session output, used to drain a burst before
@@ -1069,11 +1479,9 @@ impl Drop for TerminalGuard {
 }
 
 fn enter_world(name: &str) -> StayResult<()> {
-    // Keep the whole session on a dedicated alternate screen (the portal), clear
-    // the entrance animation away, and enable SGR mouse reporting. The client
-    // then renders the session through a vt100 emulator (see `Screenview`), which
-    // gives the alternate screen the scrollback it normally lacks: the wheel
-    // scrolls back through history just like the main screen.
+    // Keep the whole session on a dedicated alternate screen (the portal), then
+    // render it through the client-side scrollback view. Mouse reporting lets
+    // Stay make wheel scrolling and drag selection work inside that view.
     print!("{ALT_SCREEN_ENTER}");
     play_pixel_transition(name, true)?;
     print!("{CLEAR_SCREEN}{MOUSE_ON}");
@@ -1481,18 +1889,19 @@ mod tests {
     }
 
     #[test]
-    fn record_drops_history_before_clear_scrollback() {
+    fn record_keeps_history_after_clear_scrollback() {
         let mut io = SessionIo::new();
         io.record(b"old output\n");
-        io.record(b"\x1b[3Jfresh output\n");
-        assert_eq!(io.buffer, b"\x1b[3Jfresh output\n");
+        io.record(strip_clear_scrollback(b"\x1b[3Jfresh output\n").as_ref());
+        assert_eq!(io.buffer, b"old output\nfresh output\n");
     }
 
     #[test]
-    fn record_keeps_last_clear_within_a_chunk() {
-        let mut io = SessionIo::new();
-        io.record(b"a\x1b[3Jb\x1b[3Jc");
-        assert_eq!(io.buffer, b"\x1b[3Jc");
+    fn strip_clear_scrollback_removes_all_sequences_in_chunk() {
+        assert_eq!(
+            strip_clear_scrollback(b"a\x1b[3Jb\x1b[3Jc").as_ref(),
+            b"abc"
+        );
     }
 
     #[test]
@@ -1511,10 +1920,60 @@ mod tests {
     }
 
     #[test]
-    fn last_clear_scrollback_finds_sequences() {
-        assert_eq!(last_clear_scrollback(b"no sequence here"), None);
-        assert_eq!(last_clear_scrollback(b"\x1b[3J"), Some(0));
-        assert_eq!(last_clear_scrollback(b"ab\x1b[3Jcd"), Some(2));
-        assert_eq!(last_clear_scrollback(b"\x1b[3Jx\x1b[3J"), Some(5));
+    fn strip_clear_scrollback_leaves_other_output() {
+        assert_eq!(
+            strip_clear_scrollback(b"no sequence here").as_ref(),
+            b"no sequence here"
+        );
+        assert_eq!(strip_clear_scrollback(b"ab\x1b[3Jcd").as_ref(), b"abcd");
+    }
+
+    #[test]
+    fn parses_sgr_mouse_reports() {
+        assert_eq!(
+            parse_mouse_report(b"32;10;3", b'M'),
+            Some(MouseReport {
+                code: 32,
+                col: 9,
+                row: 2,
+                pressed: true
+            })
+        );
+        assert_eq!(
+            parse_mouse_report(b"0;1;1", b'm'),
+            Some(MouseReport {
+                code: 0,
+                col: 0,
+                row: 0,
+                pressed: false
+            })
+        );
+    }
+
+    #[test]
+    fn selection_spans_visible_rows() {
+        let start = SelectionPoint { row: -2, col: 3 };
+        let end = SelectionPoint { row: 0, col: 4 };
+        assert_eq!(
+            selected_span_for_visible_row(-2, 10, start, end),
+            Some((3, 10))
+        );
+        assert_eq!(
+            selected_span_for_visible_row(-1, 10, start, end),
+            Some((0, 10))
+        );
+        assert_eq!(
+            selected_span_for_visible_row(0, 10, start, end),
+            Some((0, 5))
+        );
+        assert_eq!(selected_span_for_visible_row(1, 10, start, end), None);
+    }
+
+    #[test]
+    fn base64_encodes_clipboard_payloads() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
     }
 }
