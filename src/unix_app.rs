@@ -29,6 +29,10 @@ const ALT_SCREEN_EXIT: &str = "\x1b[?1049l";
 const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
 const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
+/// Enable SGR mouse reporting so the client can capture the scroll wheel.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+/// Turn off the mouse reporting enabled by `MOUSE_ON`.
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
 const BOLD: &str = "\x1b[1m";
 const ACCENT: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
@@ -38,6 +42,10 @@ const RESET: &str = "\x1b[0m";
 const FRAME_DELAY_MS: u64 = 36;
 /// Maximum bytes of per-session output kept for replay on re-attach.
 const SCROLLBACK_LIMIT: usize = 2 * 1024 * 1024;
+/// Lines of scrollback the client's emulator keeps for wheel scrolling.
+const SCROLLBACK_LINES: usize = 10_000;
+/// Lines moved per wheel notch.
+const SCROLL_STEP: usize = 3;
 
 #[derive(Clone)]
 struct Paths {
@@ -346,7 +354,12 @@ fn handle_attach(
                         );
                     }
 
-                    message.push_str(&space_message(&name));
+                    // Match the live PTY to the terminal we are attaching from
+                    // so both the replayed history and new output wrap the same
+                    // way this client sees them.
+                    if let Some(master) = existing.master.as_ref() {
+                        set_pty_size(master, rows, cols);
+                    }
                     if command.is_some()
                         && command
                             .as_ref()
@@ -383,7 +396,6 @@ fn handle_attach(
                     existing.master = Some(master);
                     existing.io = io;
                     existing.attached = false;
-                    message.push_str(&new_session_message(&name));
                 }
             }
         } else {
@@ -398,7 +410,6 @@ fn handle_attach(
                     attached: false,
                 },
             );
-            message.push_str(&new_session_message(&name));
         }
     }
 
@@ -758,7 +769,7 @@ fn attach(name: &str, command: Option<Vec<String>>, restart: bool) -> StayResult
     }
 }
 
-fn run_raw_client(mut stream: UnixStream, name: &str, message: &str) -> StayResult<()> {
+fn run_raw_client(mut stream: UnixStream, name: &str, _message: &str) -> StayResult<()> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
     let original = tcgetattr(stdin_fd).map_err(|err| StayError::new(err.to_string()))?;
@@ -769,7 +780,7 @@ fn run_raw_client(mut stream: UnixStream, name: &str, message: &str) -> StayResu
     };
 
     guard.in_world = true;
-    enter_world(name, message)?;
+    enter_world(name)?;
 
     let mut raw = guard
         .fd_termios
@@ -780,8 +791,13 @@ fn run_raw_client(mut stream: UnixStream, name: &str, message: &str) -> StayResu
     cfmakeraw(&mut raw);
     tcsetattr(stdin_fd, SetArg::TCSANOW, &raw).map_err(|err| StayError::new(err.to_string()))?;
 
+    let (rows, cols) = terminal_size();
+    let mut view = Screenview::new(rows, cols);
+    let mut out = io::stdout();
+
     let mut input_buffer = [0_u8; 8192];
     let mut output_buffer = [0_u8; 8192];
+    let mut pending_input: Vec<u8> = Vec::new();
     let mut detached = false;
     loop {
         let (stdin_ready, stream_ready) = {
@@ -810,8 +826,22 @@ fn run_raw_client(mut stream: UnixStream, name: &str, message: &str) -> StayResu
             if read == 0 {
                 break;
             }
-            io::stdout().write_all(&output_buffer[..read])?;
-            io::stdout().flush()?;
+            view.feed(&output_buffer[..read]);
+            // Coalesce a burst (e.g. the whole history replayed on attach) into a
+            // single repaint instead of flickering through it chunk by chunk.
+            while stream_has_input(&stream)? {
+                let more = stream.read(&mut output_buffer)?;
+                if more == 0 {
+                    break;
+                }
+                view.feed(&output_buffer[..more]);
+            }
+            // While scrolled up, keep the frozen view; new output stays buffered
+            // and shows when the user scrolls back down.
+            if view.is_live() {
+                view.paint(&mut out)?;
+                out.flush()?;
+            }
         }
 
         if stdin_ready.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
@@ -825,17 +855,17 @@ fn run_raw_client(mut stream: UnixStream, name: &str, message: &str) -> StayResu
         if read == 0 {
             break;
         }
-
-        if let Some(position) = input_buffer[..read].iter().position(|byte| *byte == 0x01) {
-            if position > 0 {
-                stream.write_all(&input_buffer[..position])?;
-            }
+        if handle_client_input(
+            &mut view,
+            &mut stream,
+            &mut out,
+            &mut pending_input,
+            &input_buffer[..read],
+        )? {
             detached = true;
             let _ = stream.shutdown(Shutdown::Both);
             break;
         }
-
-        stream.write_all(&input_buffer[..read])?;
     }
 
     drop(guard);
@@ -845,6 +875,173 @@ fn run_raw_client(mut stream: UnixStream, name: &str, message: &str) -> StayResu
     }
 
     Ok(())
+}
+
+/// Client-side terminal emulator. Session output is fed into a `vt100` grid so
+/// the alternate screen gains real scrollback: live output is drawn as a minimal
+/// diff, and the wheel repaints from the grid's scrollback.
+struct Screenview {
+    parser: vt100::Parser,
+    prev: vt100::Screen,
+    scroll: usize,
+}
+
+impl Screenview {
+    fn new(rows: u16, cols: u16) -> Self {
+        let parser = vt100::Parser::new(rows.max(1), cols.max(1), SCROLLBACK_LINES);
+        let prev = parser.screen().clone();
+        Self {
+            parser,
+            prev,
+            scroll: 0,
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        self.scroll == 0
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        self.parser.process(bytes);
+    }
+
+    /// Draw the current view (live or scrolled) as a diff against what is
+    /// already on screen, so only changed cells are rewritten.
+    fn paint(&mut self, out: &mut impl Write) -> io::Result<()> {
+        self.parser.screen_mut().set_scrollback(self.scroll);
+        let diff = self.parser.screen().contents_diff(&self.prev);
+        out.write_all(&diff)?;
+        self.prev = self.parser.screen().clone();
+        Ok(())
+    }
+
+    /// Move the scrollback view; `up` heads toward older output. The wheel can
+    /// keep scrolling at the edges, and `set_scrollback` clamps at the ends.
+    fn scroll_view(&mut self, up: bool, out: &mut impl Write) -> io::Result<()> {
+        let was_live = self.is_live();
+        let target = if up {
+            self.scroll + SCROLL_STEP
+        } else {
+            self.scroll.saturating_sub(SCROLL_STEP)
+        };
+        self.parser.screen_mut().set_scrollback(target);
+        self.scroll = self.parser.screen().scrollback();
+        if was_live && !self.is_live() {
+            out.write_all(HIDE_CURSOR.as_bytes())?;
+        } else if !was_live && self.is_live() {
+            out.write_all(SHOW_CURSOR.as_bytes())?;
+        }
+        self.paint(out)
+    }
+
+    /// Snap back to the live bottom, the way typing in a normal terminal does.
+    fn snap_to_live(&mut self, out: &mut impl Write) -> io::Result<()> {
+        if !self.is_live() {
+            self.scroll = 0;
+            out.write_all(SHOW_CURSOR.as_bytes())?;
+            self.paint(out)?;
+        }
+        Ok(())
+    }
+}
+
+/// Feed raw stdin: intercept SGR mouse-wheel reports for scrolling, treat Ctrl+A
+/// (0x01) as detach, and forward everything else to the PTY. `pending` carries an
+/// unfinished mouse sequence split across reads. Returns `true` on detach.
+fn handle_client_input(
+    view: &mut Screenview,
+    stream: &mut UnixStream,
+    out: &mut impl Write,
+    pending: &mut Vec<u8>,
+    chunk: &[u8],
+) -> StayResult<bool> {
+    let mut data = std::mem::take(pending);
+    data.extend_from_slice(chunk);
+
+    let mut forward: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let byte = data[i];
+
+        // SGR mouse report: ESC [ < Cb ; Cx ; Cy (M|m). Capture the wheel; other
+        // mouse events are swallowed so they never reach the shell as garbage.
+        if byte == 0x1b && data.get(i + 1) == Some(&b'[') && data.get(i + 2) == Some(&b'<') {
+            if let Some(rel) = data[i + 3..].iter().position(|&c| c == b'M' || c == b'm') {
+                let term = i + 3 + rel;
+                if data[term] == b'M' {
+                    if let Some(up) = wheel_direction(&data[i + 3..term]) {
+                        flush_forward(view, stream, out, &mut forward)?;
+                        view.scroll_view(up, out)?;
+                    }
+                }
+                i = term + 1;
+                continue;
+            }
+            // Terminator not here yet; resume once the rest of it arrives.
+            *pending = data[i..].to_vec();
+            break;
+        }
+
+        if byte == 0x01 {
+            flush_forward(view, stream, out, &mut forward)?;
+            out.flush()?;
+            return Ok(true);
+        }
+
+        forward.push(byte);
+        i += 1;
+    }
+
+    flush_forward(view, stream, out, &mut forward)?;
+    out.flush()?;
+    Ok(false)
+}
+
+/// Send buffered keystrokes to the PTY, snapping the view to live first so any
+/// real input returns to the bottom like a normal terminal.
+fn flush_forward(
+    view: &mut Screenview,
+    stream: &mut UnixStream,
+    out: &mut impl Write,
+    forward: &mut Vec<u8>,
+) -> StayResult<()> {
+    if forward.is_empty() {
+        return Ok(());
+    }
+    view.snap_to_live(out)?;
+    stream.write_all(forward)?;
+    forward.clear();
+    Ok(())
+}
+
+/// Decode an SGR mouse payload ("Cb;Cx;Cy"): `Some(true)` for wheel-up,
+/// `Some(false)` for wheel-down, `None` for any non-wheel button.
+fn wheel_direction(payload: &[u8]) -> Option<bool> {
+    let code: u16 = std::str::from_utf8(payload)
+        .ok()?
+        .split(';')
+        .next()?
+        .parse()
+        .ok()?;
+    if code & 0b0100_0000 == 0 {
+        return None;
+    }
+    match code & 0b0000_0011 {
+        0 => Some(true),
+        1 => Some(false),
+        _ => None,
+    }
+}
+
+/// Non-blocking check for more session output, used to drain a burst before
+/// repainting.
+fn stream_has_input(stream: &UnixStream) -> StayResult<bool> {
+    let mut fds = [PollFd::new(stream.as_fd(), PollFlags::POLLIN)];
+    poll(&mut fds, PollTimeout::ZERO).map_err(|err| StayError::new(err.to_string()))?;
+    Ok(fds[0]
+        .revents()
+        .unwrap_or(PollFlags::empty())
+        .contains(PollFlags::POLLIN))
 }
 
 struct TerminalGuard {
@@ -860,6 +1057,10 @@ impl Drop for TerminalGuard {
             let _ = tcsetattr(borrowed, SetArg::TCSANOW, &termios);
         }
         if self.in_world {
+            // Turn off mouse reporting, play the exit animation on the same
+            // alternate screen we have been on all session, then leave it so the
+            // user's original terminal view returns.
+            print!("{MOUSE_OFF}{SHOW_CURSOR}");
             let _ = play_pixel_transition(&self.world_name, false);
             print!("{ALT_SCREEN_EXIT}{SHOW_CURSOR}");
             let _ = io::stdout().flush();
@@ -867,16 +1068,15 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn enter_world(name: &str, message: &str) -> StayResult<()> {
+fn enter_world(name: &str) -> StayResult<()> {
+    // Keep the whole session on a dedicated alternate screen (the portal), clear
+    // the entrance animation away, and enable SGR mouse reporting. The client
+    // then renders the session through a vt100 emulator (see `Screenview`), which
+    // gives the alternate screen the scrollback it normally lacks: the wheel
+    // scrolls back through history just like the main screen.
     print!("{ALT_SCREEN_ENTER}");
     play_pixel_transition(name, true)?;
-    print!("{CLEAR_SCREEN}");
-    println!("{DIM}stay:{name}  |  inside  |  Ctrl+A to return{RESET}");
-    if !message.is_empty() {
-        print!("{message}");
-    } else {
-        println!();
-    }
+    print!("{CLEAR_SCREEN}{MOUSE_ON}");
     io::stdout().flush()?;
     Ok(())
 }
@@ -1080,12 +1280,19 @@ fn session_path(paths: &Paths, name: &str) -> PathBuf {
     paths.sessions_dir.join(format!("{name}.json"))
 }
 
-fn new_session_message(name: &str) -> String {
-    space_message(name)
-}
-
-fn space_message(name: &str) -> String {
-    format!("{DIM}arrived in {name}{RESET}\n\n")
+/// Resize the session's PTY to the attaching terminal. The kernel delivers
+/// SIGWINCH to the running program, so it redraws for the size the user is
+/// actually looking at instead of the size the session was first opened at.
+fn set_pty_size(master: &File, rows: u16, cols: u16) {
+    let winsize = libc::winsize {
+        ws_row: rows.max(1),
+        ws_col: cols.max(1),
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe {
+        libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &winsize);
+    }
 }
 
 fn print_completion_usage() {
