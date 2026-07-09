@@ -19,8 +19,9 @@ Compared with `screen`, Stay keeps the workflow smaller:
   animated hand-off, then the scroll wheel pages back through everything it
   printed.
 - Smart tab completion: shell completions can suggest existing session names.
-- Drag selection: select text inside Stay's alternate screen, including dragging
-  to the top or bottom edge to keep scrolling through history.
+- Drag selection: select text inside Stay's alternate screen, drag to the top or
+  bottom edge to keep scrolling through history, then press your terminal's copy
+  shortcut.
 - Persistent records: Stay keeps each session's replay history on disk. If a
   task exits, `stay <name>` opens the saved scrollback first; leave with Ctrl+A,
   then press Enter if you want to restart the last command.

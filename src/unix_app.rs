@@ -43,7 +43,8 @@ const INVERT_ON: &str = "\x1b[7m";
 const INVERT_OFF: &str = "\x1b[27m";
 
 /// Delay between transition animation frames. Lower is faster.
-const FRAME_DELAY_MS: u64 = 36;
+const FRAME_DELAY_MS: u64 = 18;
+const CTRL_C: u8 = 0x03;
 /// Maximum bytes of per-session output kept for replay on re-attach.
 const SCROLLBACK_LIMIT: usize = 2 * 1024 * 1024;
 /// Lines of scrollback the client's emulator keeps for wheel scrolling.
@@ -51,7 +52,9 @@ const SCROLLBACK_LINES: usize = 10_000;
 /// Lines moved per wheel notch.
 const SCROLL_STEP: usize = 3;
 /// How often drag-selection scrolls while the pointer is held at an edge.
-const AUTO_SCROLL_INTERVAL_MS: u16 = 60;
+const AUTO_SCROLL_INTERVAL_MS: u16 = 24;
+/// Rows near the top/bottom that keep drag-selection auto-scroll active.
+const AUTO_SCROLL_EDGE_ROWS: u16 = 2;
 
 #[derive(Clone)]
 struct Paths {
@@ -603,8 +606,8 @@ fn serve_attached(stream: &mut UnixStream, master: &File, io: &SharedIo) -> Stay
 }
 
 /// Replay saved history without a live PTY. The client still handles scrolling,
-/// selection, and Ctrl+A locally, while this side just keeps the connection open
-/// until the user leaves the history view.
+/// selection, copy shortcuts, and Ctrl+A locally, while this side just keeps the
+/// connection open until the user leaves the history view.
 fn serve_history(stream: &mut UnixStream, io: &SharedIo) -> StayResult<()> {
     {
         let io_guard = io.lock().expect("session io lock poisoned");
@@ -1029,6 +1032,7 @@ fn run_raw_client_mode(stream: &mut UnixStream, name: &str, mode: ClientMode) ->
     let mut input_buffer = [0_u8; 8192];
     let mut output_buffer = [0_u8; 8192];
     let mut pending_input: Vec<u8> = Vec::new();
+    let mut next_auto_scroll: Option<Instant> = None;
     let mut detached = false;
     loop {
         let (stdin_ready, stream_ready) = {
@@ -1042,15 +1046,10 @@ fn run_raw_client_mode(stream: &mut UnixStream, name: &str, mode: ClientMode) ->
                     PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
                 ),
             ];
-            let timeout = if view.auto_scroll_direction().is_some() {
-                PollTimeout::from(AUTO_SCROLL_INTERVAL_MS)
-            } else {
-                PollTimeout::NONE
-            };
+            let timeout = auto_scroll_poll_timeout(&view, &mut next_auto_scroll);
             let ready = poll(&mut fds, timeout).map_err(|err| StayError::new(err.to_string()))?;
             if ready == 0 {
-                view.auto_scroll_selection(&mut out)?;
-                out.flush()?;
+                run_due_auto_scroll(&mut view, &mut out, &mut next_auto_scroll)?;
                 continue;
             }
             (
@@ -1084,6 +1083,7 @@ fn run_raw_client_mode(stream: &mut UnixStream, name: &str, mode: ClientMode) ->
                 out.flush()?;
             }
         }
+        run_due_auto_scroll(&mut view, &mut out, &mut next_auto_scroll)?;
 
         if stdin_ready.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
             break;
@@ -1107,6 +1107,7 @@ fn run_raw_client_mode(stream: &mut UnixStream, name: &str, mode: ClientMode) ->
             let _ = stream.shutdown(Shutdown::Both);
             break;
         }
+        run_due_auto_scroll(&mut view, &mut out, &mut next_auto_scroll)?;
     }
 
     drop(guard);
@@ -1121,6 +1122,48 @@ fn run_raw_client_mode(stream: &mut UnixStream, name: &str, mode: ClientMode) ->
     }
 
     Ok(())
+}
+
+fn auto_scroll_poll_timeout(
+    view: &Screenview,
+    next_auto_scroll: &mut Option<Instant>,
+) -> PollTimeout {
+    if view.auto_scroll_direction().is_none() {
+        *next_auto_scroll = None;
+        return PollTimeout::NONE;
+    }
+
+    let now = Instant::now();
+    let deadline = next_auto_scroll.get_or_insert(now);
+    if *deadline <= now {
+        PollTimeout::ZERO
+    } else {
+        duration_to_poll_timeout(deadline.saturating_duration_since(now))
+    }
+}
+
+fn run_due_auto_scroll(
+    view: &mut Screenview,
+    out: &mut impl Write,
+    next_auto_scroll: &mut Option<Instant>,
+) -> io::Result<()> {
+    if view.auto_scroll_direction().is_none() {
+        *next_auto_scroll = None;
+        return Ok(());
+    }
+
+    let now = Instant::now();
+    if next_auto_scroll.map_or(true, |deadline| now >= deadline) {
+        view.auto_scroll_selection(out)?;
+        out.flush()?;
+        *next_auto_scroll = Some(now + Duration::from_millis(u64::from(AUTO_SCROLL_INTERVAL_MS)));
+    }
+    Ok(())
+}
+
+fn duration_to_poll_timeout(duration: Duration) -> PollTimeout {
+    let millis = duration.as_millis().clamp(1, u128::from(u16::MAX)) as u16;
+    PollTimeout::from(millis)
 }
 
 /// Client-side terminal emulator. Session output is fed into a `vt100` grid so
@@ -1224,33 +1267,45 @@ impl Screenview {
         });
     }
 
-    fn update_selection(&mut self, row: u16, col: u16) {
+    fn update_selection(&mut self, row: u16, col: u16) -> bool {
         let focus = self.point_for_visible_cell(row, col);
         let edge = self.edge_for_row(row);
         if let Some(selection) = self.selection.as_mut() {
+            let moved = selection.moved || focus != selection.anchor;
+            let changed = selection.focus != focus
+                || selection.moved != moved
+                || selection.edge != edge
+                || selection.last_col != col;
             selection.focus = focus;
-            selection.moved |= selection.focus != selection.anchor;
+            selection.moved = moved;
             selection.edge = edge;
             selection.last_col = col;
+            changed
+        } else {
+            false
         }
     }
 
-    fn finish_selection(&mut self) -> Option<String> {
+    fn finish_selection(&mut self) {
         if let Some(selection) = self.selection.as_mut() {
             selection.dragging = false;
             selection.edge = None;
         }
         if !self.selection_visible() {
             self.selection = None;
-            return None;
         }
+    }
 
+    fn copy_selection_to_clipboard(&mut self, out: &mut impl Write) -> io::Result<bool> {
+        if !self.selection_visible() {
+            return Ok(false);
+        }
         let text = self.selected_text();
         if text.is_empty() {
-            self.selection = None;
-            None
+            Ok(false)
         } else {
-            Some(text)
+            write_osc52_clipboard(out, &text)?;
+            Ok(true)
         }
     }
 
@@ -1324,9 +1379,14 @@ impl Screenview {
 
     fn edge_for_row(&self, row: u16) -> Option<EdgeScroll> {
         let (rows, _) = self.parser.screen().size();
-        if row == 0 {
+        let edge_rows = if rows <= AUTO_SCROLL_EDGE_ROWS.saturating_mul(2) {
+            1
+        } else {
+            AUTO_SCROLL_EDGE_ROWS
+        };
+        if row < edge_rows {
             Some(EdgeScroll::Up)
-        } else if row >= rows.saturating_sub(1) {
+        } else if row >= rows.saturating_sub(edge_rows) {
             Some(EdgeScroll::Down)
         } else {
             None
@@ -1507,7 +1567,8 @@ fn selected_cells_text(screen: &vt100::Screen, row: u16, start_col: u16, end_col
 }
 
 /// Feed raw stdin: intercept SGR mouse reports for scrollback and selection,
-/// treat Ctrl+A (0x01) as detach, and forward everything else to the PTY.
+/// treat Ctrl+A (0x01) as detach, copy a visible selection on Ctrl+C, and
+/// forward everything else to the PTY.
 /// `pending` carries an unfinished mouse sequence split across reads.
 fn handle_client_input(
     view: &mut Screenview,
@@ -1542,6 +1603,11 @@ fn handle_client_input(
             flush_forward(view, stream, out, &mut forward)?;
             out.flush()?;
             return Ok(true);
+        }
+
+        if byte == CTRL_C && view.copy_selection_to_clipboard(out)? {
+            i += 1;
+            continue;
         }
 
         forward.push(byte);
@@ -1600,10 +1666,7 @@ fn handle_mouse_report(
     }
 
     if !report.pressed {
-        if let Some(text) = view.finish_selection() {
-            write_osc52_clipboard(out, &text)?;
-        }
-        view.paint(out)?;
+        view.finish_selection();
         return Ok(());
     }
 
@@ -1611,8 +1674,9 @@ fn handle_mouse_report(
     let motion = report.code & 0b0010_0000 != 0;
 
     if left_button && motion {
-        view.update_selection(report.row, report.col);
-        view.paint(out)?;
+        if view.update_selection(report.row, report.col) {
+            view.paint(out)?;
+        }
     } else if left_button {
         view.start_selection(report.row, report.col);
         view.paint(out)?;
@@ -2251,6 +2315,116 @@ mod tests {
             Some((0, 5))
         );
         assert_eq!(selected_span_for_visible_row(1, 10, start, end), None);
+    }
+
+    #[test]
+    fn repeated_selection_motion_reports_no_change() {
+        let mut view = Screenview::new(2, 12);
+        view.start_selection(0, 0);
+
+        assert!(view.update_selection(0, 4));
+        assert!(!view.update_selection(0, 4));
+    }
+
+    #[test]
+    fn auto_scroll_edge_uses_small_hot_zone() {
+        let view = Screenview::new(6, 12);
+
+        assert_eq!(view.edge_for_row(0), Some(EdgeScroll::Up));
+        assert_eq!(view.edge_for_row(1), Some(EdgeScroll::Up));
+        assert_eq!(view.edge_for_row(2), None);
+        assert_eq!(view.edge_for_row(3), None);
+        assert_eq!(view.edge_for_row(4), Some(EdgeScroll::Down));
+        assert_eq!(view.edge_for_row(5), Some(EdgeScroll::Down));
+    }
+
+    #[test]
+    fn mouse_release_keeps_selection_without_copying() {
+        let mut view = Screenview::new(2, 12);
+        view.feed(b"hello world");
+        let mut out = Vec::new();
+
+        handle_mouse_report(
+            &mut view,
+            &mut out,
+            MouseReport {
+                code: 0,
+                col: 0,
+                row: 0,
+                pressed: true,
+            },
+        )
+        .unwrap();
+        handle_mouse_report(
+            &mut view,
+            &mut out,
+            MouseReport {
+                code: 32,
+                col: 4,
+                row: 0,
+                pressed: true,
+            },
+        )
+        .unwrap();
+
+        out.clear();
+        handle_mouse_report(
+            &mut view,
+            &mut out,
+            MouseReport {
+                code: 0,
+                col: 4,
+                row: 0,
+                pressed: false,
+            },
+        )
+        .unwrap();
+
+        assert!(view.selection_visible());
+        assert!(!String::from_utf8_lossy(&out).contains("]52;"));
+    }
+
+    #[test]
+    fn ctrl_c_copies_visible_selection_without_forwarding() {
+        let mut view = Screenview::new(2, 12);
+        view.feed(b"hello world");
+        view.start_selection(0, 0);
+        assert!(view.update_selection(0, 4));
+
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let mut out = Vec::new();
+        let mut pending = Vec::new();
+
+        let detached =
+            handle_client_input(&mut view, &mut client, &mut out, &mut pending, b"\x03").unwrap();
+
+        assert!(!detached);
+        assert!(pending.is_empty());
+        assert!(String::from_utf8_lossy(&out).contains("\x1b]52;c;aGVsbG8=\x07"));
+
+        let mut forwarded = [0_u8; 1];
+        match server.read(&mut forwarded) {
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            other => panic!("Ctrl+C should not be forwarded with a visible selection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_c_without_selection_is_forwarded() {
+        let mut view = Screenview::new(2, 12);
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let mut out = Vec::new();
+        let mut pending = Vec::new();
+
+        let detached =
+            handle_client_input(&mut view, &mut client, &mut out, &mut pending, b"\x03").unwrap();
+
+        let mut forwarded = [0_u8; 1];
+        server.read_exact(&mut forwarded).unwrap();
+        assert!(!detached);
+        assert!(pending.is_empty());
+        assert_eq!(forwarded, [CTRL_C]);
     }
 
     #[test]
