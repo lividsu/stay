@@ -860,21 +860,7 @@ fn ensure_daemon() -> StayResult<()> {
         if connect_daemon().is_ok() {
             match running_sessions_from_existing_daemon() {
                 Ok(running) if running.is_empty() => {}
-                Ok(running) => {
-                    let names = running
-                        .iter()
-                        .map(|session| session.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(StayError::new(format!(
-                        "A stay daemon from another version is already running with active sessions: {names}\n\nFinish or kill those sessions before starting the new daemon."
-                    )));
-                }
-                Err(err) => {
-                    return Err(StayError::new(format!(
-                        "A stay daemon from another version is already running, but Stay could not inspect it:\n\n{err}\n\nStop the old daemon, then try again."
-                    )));
-                }
+                Ok(_) | Err(_) => return Ok(()),
             }
         }
         let _ = fs::remove_file(&paths.daemon_socket);
